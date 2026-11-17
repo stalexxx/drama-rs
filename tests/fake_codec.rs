@@ -92,9 +92,13 @@ fn build_codec(path: &std::path::Path) {
         f.add_f16(&mut rng, &(p.clone() + "w"), vec![2 * D, D], 0.01);
         f.add_f32(&mut rng, &(p.clone() + "b"), vec![2 * D], 0.1);
         let q = p + "cnx.";
-        for n in ["dw_w", "dw_b", "ln_w", "ln_b", "pw1_b", "pw2_b", "gamma"] {
+        // Shapes must match the real codec (dr_* kernels read full rows):
+        // dw_w is [D, 7] (depthwise kernel), pw1_b is [4*D] (expanded width).
+        f.add_f32(&mut rng, &(q.clone() + "dw_w"), vec![D, 7], 0.1);
+        for n in ["dw_b", "ln_w", "ln_b", "pw2_b", "gamma"] {
             f.add_f32(&mut rng, &(q.clone() + n), vec![D], if n.starts_with("ln") || n == "gamma" { 1.0 } else { 0.1 });
         }
+        f.add_f32(&mut rng, &(q.clone() + "pw1_b"), vec![4 * D], 0.1);
         f.add_f16(&mut rng, &(q.clone() + "pw1_w"), vec![4 * D, D], 0.01);
         f.add_f16(&mut rng, &(q.clone() + "pw2_w"), vec![D, 4 * D], 0.01);
     }

@@ -18,6 +18,19 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::ffi::{GraphExec, Half, Stream};
 
+// Apple Accelerate (AMX) SGEMM for the prefill/codec GEMMs: one framework call
+// replaces the naive triple loop (orders of magnitude faster on big shapes).
+#[link(name = "Accelerate", kind = "framework")]
+extern "C" {
+    fn cblas_sgemm(
+        order: i32, transa: i32, transb: i32, m: i32, n: i32, k: i32, alpha: f32, a: *const f32, lda: i32,
+        b: *const f32, ldb: i32, beta: f32, c: *mut f32, ldc: i32,
+    );
+}
+const CBLAS_ROW_MAJOR: i32 = 101;
+const CBLAS_NO_TRANS: i32 = 111;
+const CBLAS_TRANS: i32 = 112;
+
 // ---------------------------------------------------------------------------
 // thread-safe Metal handle wrappers (Metal objects are internally synchronized)
 
@@ -141,6 +154,12 @@ struct Capture {
 
 std::thread_local! {
     static CAPTURE: std::cell::RefCell<Option<Capture>> = const { std::cell::RefCell::new(None) };
+    // H1: pending (queue, command buffer, encoder) triples. dispatches encode
+    // back-to-back; flush_gpu() ends/commits/waits them all. Buffers from the
+    // same serial queue execute in commit order, so GPU->GPU chains need no
+    // intermediate sync; CPU reads of GPU data must flush first.
+    static PENDING: std::cell::RefCell<Vec<(usize, metal::CommandBuffer, metal::ComputeCommandEncoder, &'static str)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 struct GraphData {
@@ -341,6 +360,186 @@ kernel void rmsnorm(device const float* x [[buffer(0)]],
 
 struct GemvP { uint n; uint k; };
 struct GemvQ8P { uint n; uint k; };
+
+struct MoeP { uint h; uint mi; uint topk; uint k; };
+
+
+inline float dot_q4_elem(device const uchar* Q, device const ushort* SM, uint row, uint K, uint j, float x) {
+    uint qb = Q[row * (K / 2) + j / 2];
+    uint q = (qb >> ((j & 1u) * 4u)) & 15u;
+    uint g = j / 64;
+    ushort2 smh = ushort2(SM[row * (K / 64) * 2 + g * 2], SM[row * (K / 64) * 2 + g * 2 + 1]);
+    float2 sm = (float2)as_type<half2>(smh);
+    return ((float)q * sm.x + sm.y) * x;
+}
+
+inline float dot_q8_elem(device const uchar* W, device const ushort* S, uint row, uint K, uint j, float x) {
+    uint u = W[row * K + j];
+    float wv = (float)(int)u - 256.0f * (float)(u >> 7);
+    float s = (float)as_type<half>(S[row * (K / 128) + j / 128]);
+    return wv * s * x;
+}
+
+// MoE decode gate: one threadgroup per act row ((topk+1)*I rows).
+// Row kk*I+j holds silu(G . x) * (U . x) for routed expert idx[kk] (q4),
+// the last block (kk == topk) is the shared int8 expert.
+kernel void moe_gate_up(device const uchar* GQ [[buffer(0)]],
+                    device const ushort* GS [[buffer(1)]],
+                    device const uchar* SGQ [[buffer(2)]],
+                    device const ushort* SGS [[buffer(3)]],
+                    device const float* X [[buffer(4)]],
+                    device const int* IDX [[buffer(5)]],
+                    device float* ACT [[buffer(6)]],
+                    constant MoeP& p [[buffer(7)]],
+                    uint3 tpg [[threads_per_threadgroup]],
+                    uint3 tid [[thread_position_in_threadgroup]],
+                    uint3 gid [[threadgroup_position_in_grid]]) {
+    uint slot = gid.x;
+    uint mi = p.mi, k = p.k;
+    if (slot >= (p.topk + 1) * mi) return;
+    uint kk = slot / mi, j = slot % mi;
+    float g = 0.0f, u = 0.0f;
+    if (kk < p.topk) {
+        uint e = (uint)IDX[kk];
+        for (uint t = tid.x; t < k; t += tpg.x) {
+            g += dot_q4_elem(GQ, GS, e * 2 * mi + j, k, t, X[t]);
+            u += dot_q4_elem(GQ, GS, e * 2 * mi + mi + j, k, t, X[t]);
+        }
+    } else {
+        for (uint t = tid.x; t < k; t += tpg.x) {
+            g += dot_q8_elem(SGQ, SGS, j, k, t, X[t]);
+            u += dot_q8_elem(SGQ, SGS, mi + j, k, t, X[t]);
+        }
+    }
+    threadgroup float part[256];
+    part[tid.x] = g;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg.x >> 1; s > 0; s >>= 1) {
+        if (tid.x < s) part[tid.x] += part[tid.x + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    g = part[0];
+    part[tid.x] = u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg.x >> 1; s > 0; s >>= 1) {
+        if (tid.x < s) part[tid.x] += part[tid.x + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    u = part[0];
+    if (tid.x == 0) ACT[slot] = (g / (1.0f + exp(-g))) * u;
+}
+
+// MoE decode down: one threadgroup per output row y[n] =
+// res[n] + sigmoid(sgate) * shared[n] + sum_k w[k] * D[n] . act[k].
+kernel void moe_down(device const uchar* DQ [[buffer(0)]],
+                 device const ushort* DS [[buffer(1)]],
+                 device const uchar* SDQ [[buffer(2)]],
+                 device const ushort* SDS [[buffer(3)]],
+                 device const float* ACT [[buffer(4)]],
+                 device const int* IDX [[buffer(5)]],
+                 device const float* WTS [[buffer(6)]],
+                 device const float* SGRT [[buffer(7)]],
+                 device const float* RES [[buffer(8)]],
+                 device float* Y [[buffer(9)]],
+                 constant MoeP& p [[buffer(10)]],
+                 uint3 tpg [[threads_per_threadgroup]],
+                 uint3 tid [[thread_position_in_threadgroup]],
+                 uint3 gid [[threadgroup_position_in_grid]]) {
+    uint n = gid.x;
+    uint h = p.h, mi = p.mi;
+    if (n >= h) return;
+    float acc = 0.0f;
+    uint total = p.topk * mi;
+    for (uint t = tid.x; t < total; t += tpg.x) {
+        uint kk = t / mi, j = t % mi;
+        uint e = (uint)IDX[kk];
+        uint qb = DQ[(e * h + n) * (mi / 2) + j / 2];
+        uint q = (qb >> ((j & 1u) * 4u)) & 15u;
+        uint g = j / 64;
+        ushort2 smh = ushort2(DS[(e * h + n) * (mi / 64) * 2 + g * 2], DS[(e * h + n) * (mi / 64) * 2 + g * 2 + 1]);
+        float2 sm = (float2)as_type<half2>(smh);
+        acc += WTS[kk] * ((float)q * sm.x + sm.y) * ACT[kk * mi + j];
+    }
+    threadgroup float part[256];
+    part[tid.x] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg.x >> 1; s > 0; s >>= 1) {
+        if (tid.x < s) part[tid.x] += part[tid.x + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid.x == 0) {
+        float sh = 0.0f;
+        for (uint j = 0; j < mi; ++j) sh += dot_q8_elem(SDQ, SDS, n, mi, j, ACT[p.topk * mi + j]);
+        float sg = 1.0f / (1.0f + exp(-SGRT[0]));
+        Y[n] = RES[n] + sg * sh + part[0];
+    }
+}
+struct MoePFP { uint total; uint k; uint mi; uint h; };
+
+inline float bf16_to_f32_msl(ushort b) {
+    return as_type<float>((uint)b << 16);
+}
+
+inline ushort f32_to_bf16_msl(float v) {
+    uint b = as_type<uint>(v);
+    if ((b & 0x7f800000u) == 0x7f800000u && (b & 0x007fffffu) != 0) return 0x7fc0u;
+    return (ushort)((b + 0x7fffu + ((b >> 16) & 1u)) >> 16);
+}
+
+// MoE prefill gate: one threadgroup per slot; 256 threads x 2 cols each.
+// act[s*mi+j] = bf16(silu(G_e . x) * (U_e . x)), e = slot_expert[s].
+kernel void moe_pf_gate_up(device const uchar* GQ [[buffer(0)]],
+                       device const ushort* GS [[buffer(1)]],
+                       device const ushort* XP [[buffer(2)]],
+                       device const int* SE [[buffer(3)]],
+                       device ushort* ACT [[buffer(4)]],
+                       constant MoePFP& p [[buffer(5)]],
+                       uint3 tpg [[threads_per_threadgroup]],
+                       uint3 tid [[thread_position_in_threadgroup]],
+                       uint3 gid [[threadgroup_position_in_grid]]) {
+    uint s = gid.x;
+    if (s >= p.total) return;
+    uint mi = p.mi, k = p.k;
+    uint e = (uint)SE[s];
+    for (uint jj = 0; jj < 2; ++jj) {
+        uint j = tid.x * 2 + jj;
+        if (j >= mi) return;
+        float g = 0.0f, u = 0.0f;
+        for (uint t = 0; t < k; ++t) {
+            float x = bf16_to_f32_msl(XP[s * k + t]);
+            g += dot_q4_elem(GQ, GS, e * 2 * mi + j, k, t, x);
+            u += dot_q4_elem(GQ, GS, e * 2 * mi + mi + j, k, t, x);
+        }
+        ACT[s * mi + j] = f32_to_bf16_msl((g / (1.0f + exp(-g))) * u);
+    }
+}
+
+// MoE prefill down: one threadgroup per slot; 256 threads x 8 rows each.
+// y[s*h+n] = D_e[n] . act[s].
+kernel void moe_pf_down(device const uchar* DQ [[buffer(0)]],
+                    device const ushort* DS [[buffer(1)]],
+                    device const ushort* ACT [[buffer(2)]],
+                    device const int* SE [[buffer(3)]],
+                    device float* Y [[buffer(4)]],
+                    constant MoePFP& p [[buffer(5)]],
+                    uint3 tpg [[threads_per_threadgroup]],
+                    uint3 tid [[thread_position_in_threadgroup]],
+                    uint3 gid [[threadgroup_position_in_grid]]) {
+    uint s = gid.x;
+    if (s >= p.total) return;
+    uint mi = p.mi, h = p.h;
+    uint e = (uint)SE[s];
+    for (uint nn = 0; nn < 8; ++nn) {
+        uint n = tid.x * 8 + nn;
+        if (n >= h) return;
+        float acc = 0.0f;
+        for (uint j = 0; j < mi; ++j) {
+            float a = bf16_to_f32_msl(ACT[s * mi + j]);
+            acc += dot_q4_elem(DQ, DS, e * h + n, mi, j, a);
+        }
+        Y[s * h + n] = acc;
+    }
+}
 kernel void gemv_q8(device const uchar* W [[buffer(0)]],
                     device const ushort* S [[buffer(1)]],
                     device const float* x [[buffer(2)]],
@@ -448,6 +647,22 @@ struct GemvQ8P {
 }
 
 #[repr(C)]
+struct MoeP {
+    h: u32,
+    mi: u32,
+    topk: u32,
+    k: u32,
+}
+
+#[repr(C)]
+struct MoePFP {
+    total: u32,
+    k: u32,
+    mi: u32,
+    h: u32,
+}
+
+#[repr(C)]
 struct DqP {
     n: u32,
     k: u32,
@@ -459,29 +674,55 @@ fn pb<T>(v: &T) -> &[u8] {
 
 /// Dispatch an MSL kernel. `bufs` are (pointer, extra_offset); null pointers become
 /// nil buffers. `params` go to the next buffer index as inline constants.
+fn pending_enc(q: usize) -> bool {
+    PENDING.with(|p| {
+        if p.borrow().iter().any(|(qq, _, _, _)| *qq == q) {
+            return true;
+        }
+        let c = ctx();
+        let queue = &c.queue.0;
+        let cb = queue.new_command_buffer().to_owned();
+        let enc = cb.new_compute_command_encoder().to_owned();
+        p.borrow_mut().push((q, cb, enc, ""));
+        true
+    })
+}
+
+/// End, commit and wait for every pending command buffer (all queues).
+/// Call before any CPU read of GPU-produced data and at graph end.
+fn flush_gpu() {
+    PENDING.with(|p| {
+        let mut p = p.borrow_mut();
+        for (_, cb, enc, _) in p.drain(..) {
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        }
+    });
+}
+
 fn dispatch(name: &'static str, bufs: &[Option<(MBuf, u64)>], params: &[u8], grid: (u64, u64, u64), tg: (u64, u64, u64), threadgroups: bool) {
     let p = pipe(name);
-    let c = ctx();
-    let cb = c.queue.0.new_command_buffer();
-    let enc = cb.new_compute_command_encoder();
-    enc.set_compute_pipeline_state(&p.0);
-    for (i, b) in bufs.iter().enumerate() {
-        match b {
-            Some((buf, off)) => enc.set_buffer(i as u64, Some(&buf.0), *off),
-            None => enc.set_buffer(i as u64, None, 0),
+    pending_enc(0);
+    PENDING.with(|pp| {
+        let ppp = pp.borrow();
+        let (_, _, enc, _) = ppp.iter().find(|(qq, _, _, _)| *qq == 0).expect("dispatch: no pending buffer");
+        enc.set_compute_pipeline_state(&p.0);
+        for (i, b) in bufs.iter().enumerate() {
+            match b {
+                Some((buf, off)) => enc.set_buffer(i as u64, Some(&buf.0), *off),
+                None => enc.set_buffer(i as u64, None, 0),
+            }
         }
-    }
-    enc.set_bytes(bufs.len() as u64, params.len() as u64, params.as_ptr() as *const c_void);
-    let g = metal::MTLSize { width: grid.0, height: grid.1, depth: grid.2 };
-    let t = metal::MTLSize { width: tg.0, height: tg.1, depth: tg.2 };
-    if threadgroups {
-        enc.dispatch_thread_groups(g, t);
-    } else {
-        enc.dispatch_threads(g, t);
-    }
-    enc.end_encoding();
-    cb.commit();
-    cb.wait_until_completed();
+        enc.set_bytes(bufs.len() as u64, params.len() as u64, params.as_ptr() as *const c_void);
+        let g = metal::MTLSize { width: grid.0, height: grid.1, depth: grid.2 };
+        let t = metal::MTLSize { width: tg.0, height: tg.1, depth: tg.2 };
+        if threadgroups {
+            enc.dispatch_thread_groups(g, t);
+        } else {
+            enc.dispatch_threads(g, t);
+        }
+    });
 }
 
 fn opt_buf(ptr: *const c_void, extra: u64) -> Option<(MBuf, u64)> {
@@ -496,20 +737,35 @@ fn ceil256(n: u64) -> u64 {
     (n + 255) / 256 * 256
 }
 
-// Scratch f32 vector for fused-norm GEMVs (grown monotonically, reused; execution
-// is synchronous so there is no aliasing hazard).
-static SCRATCH: Mutex<Option<MBuf>> = Mutex::new(None);
+// Scratch buffers are thread-local: parallel callers (tests; future engine
+// threads) must never clobber each other's convert/norm staging. A single
+// thread reuses its buffer monotonically (execution is synchronous, so there
+// is no aliasing hazard within a thread).
+std::thread_local! {
+    static SCRATCH: std::cell::RefCell<Option<MBuf>> = const { std::cell::RefCell::new(None) };
+    static SCRATCH_W: std::cell::RefCell<Option<MBuf>> = const { std::cell::RefCell::new(None) };
+}
 
 fn scratch_f32(n_elems: usize) -> (MBuf, u64) {
-    let mut s = SCRATCH.lock().unwrap();
-    let need = (n_elems.max(1) as u64) * 4;
-    let ok = s.as_ref().map(|b| b.0.length() >= need).unwrap_or(false);
-    if !ok {
-        let b = ctx().device.0.new_buffer(need, metal::MTLResourceOptions::StorageModeShared);
-        track(&b);
-        *s = Some(MBuf(b));
-    }
-    (s.as_ref().unwrap().clone(), 0)
+    scratch_here(&SCRATCH, n_elems)
+}
+
+fn scratch_f32_w(n_elems: usize) -> (MBuf, u64) {
+    scratch_here(&SCRATCH_W, n_elems)
+}
+
+fn scratch_here(slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<MBuf>>>, n_elems: usize) -> (MBuf, u64) {
+    slot.with(|s| {
+        let mut s = s.borrow_mut();
+        let need = (n_elems.max(1) as u64) * 4;
+        let ok = s.as_ref().map(|b| b.0.length() >= need).unwrap_or(false);
+        if !ok {
+            let b = ctx().device.0.new_buffer(need, metal::MTLResourceOptions::StorageModeShared);
+            track(&b);
+            *s = Some(MBuf(b));
+        }
+        (s.as_ref().unwrap().clone(), 0)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -654,27 +910,68 @@ pub unsafe fn dr_host_free(p: *mut c_void) -> i32 {
     0
 }
 
-unsafe fn raw_copy(dst: *mut c_void, src: *const c_void, n: usize) {
+unsafe extern "C" {
+    fn posix_madvise(addr: *const c_void, len: usize, advice: i32) -> i32;
+    fn mlock(addr: *const c_void, len: usize) -> i32;
+}
+
+/// Drop clean file pages backing a just-uploaded weight tensor (macOS page
+/// size is 16 KiB on Apple Silicon). Safe: pages are clean (re-faultable)
+/// and never read again after upload.
+fn release_file_pages(p: *const u8, n: usize) {
+    const SZ: usize = 16384;
+    const DONTNEED: i32 = 4;
+    let a = p as usize & !(SZ - 1);
+    let b = (p as usize + n + SZ - 1) & !(SZ - 1);
+    unsafe {
+        posix_madvise(a as *const c_void, b - a, DONTNEED);
+    }
+}
+
+fn raw_copy(dst: *mut c_void, src: *const c_void, n: usize) {
     if n == 0 {
         return;
     }
-    std::ptr::copy(src as *const u8, dst as *mut u8, n);
+    unsafe { std::ptr::copy(src as *const u8, dst as *mut u8, n) };
 }
 
 pub unsafe fn dr_h2d(d: *mut c_void, h: *const c_void, n: usize, st: Stream) -> i32 {
-    launch(st, move || raw_copy(d, h, n))
+    launch(st, move || raw_copy(d, h, n));
+    // Weight uploads are read-once file pages (safetensors mmaps). Keeping
+    // 21 GB of them in page cache next to 20 GB of Metal buffers forces the
+    // OS into swap thrash on a 32 GB machine (observed: 150+ GB swapped,
+    // every cold weight touch stalling 100-800 ms). Release them right away.
+    // Runtime staging uploads are KBs and never hit this path (threshold).
+    if n > 1 << 20 {
+        release_file_pages(h as *const u8, n);
+        // Pin the just-written destination pages: 20 GB of weights must
+        // never be swapped (a single swapped-out layer stalls prefill by
+        // ~1 s on first touch). Cheap here: pages are already resident.
+        unsafe {
+            mlock(d, n);
+        }
+    }
+    0
 }
 
 pub unsafe fn dr_d2h(h: *mut c_void, d: *const c_void, n: usize, st: Stream) -> i32 {
-    launch(st, move || raw_copy(h, d, n))
+    // CPU reads GPU-produced data: drain the pending batch first.
+    launch(st, move || {
+        flush_gpu();
+        raw_copy(h, d, n)
+    })
 }
 
 pub unsafe fn dr_d2d(d: *mut c_void, s: *const c_void, n: usize, st: Stream) -> i32 {
-    launch(st, move || raw_copy(d, s, n))
+    launch(st, move || {
+        flush_gpu();
+        raw_copy(d, s, n)
+    })
 }
 
 pub unsafe fn dr_memset(d: *mut c_void, v: i32, n: usize, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         if n > 0 {
             std::slice::from_raw_parts_mut(d as *mut u8, n).fill(v as u8);
         }
@@ -689,7 +986,8 @@ pub unsafe fn dr_stream_create(s: *mut Stream) -> i32 {
 }
 
 pub unsafe fn dr_stream_sync(_s: Stream) -> i32 {
-    // Synchronous execution: every launch already waited.
+    // H1: with batched dispatches, sync must drain the pending queue.
+    flush_gpu();
     0
 }
 
@@ -729,6 +1027,7 @@ pub unsafe fn dr_graph_launch(exec: GraphExec, _st: Stream) -> i32 {
             return 1;
         }
     }
+    flush_gpu();
     0
 }
 
@@ -754,20 +1053,40 @@ pub unsafe fn dr_gemm(_h: *mut c_void, a: *const Half, w: *const Half, c: *mut f
         return 0;
     }
     let (m, n, k) = (m as usize, n as usize, k as usize);
+    // bf16 inputs -> f32 scratch (bandwidth-bound, threaded), then one AMX SGEMM.
+    // C[m, n] = A[m, k] . W[n, k]^T + beta * C (row-major).
+    let (abuf, _) = scratch_f32(m * k);
+    let (wbuf, _) = scratch_f32_w(n * k);
     let (a, w, c) = (SendPtr(a as *mut Half), SendPtr(w as *mut Half), SendPtr(c));
-    par_for!(m, |lo, hi| {
-        for r in lo..hi {
-            for cc in 0..n {
-                let mut acc = 0.0f32;
-                for j in 0..k {
-                    acc += bf16_to_f32(unsafe { a.read(r * k + j) }) * bf16_to_f32(unsafe { w.read(cc * k + j) });
-                }
-                unsafe {
-                    c.write(r * n + cc, acc + beta * c.read(r * n + cc));
-                }
-            }
+    let (af, wf) = (SendPtr(abuf.0.contents() as *mut f32), SendPtr(wbuf.0.contents() as *mut f32));
+    par_for!(m * k, |lo, hi| {
+        for i in lo..hi {
+            unsafe { af.write(i, bf16_to_f32(a.read(i))) };
         }
     });
+    par_for!(n * k, |lo, hi| {
+        for i in lo..hi {
+            unsafe { wf.write(i, bf16_to_f32(w.read(i))) };
+        }
+    });
+    unsafe {
+        cblas_sgemm(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_TRANS,
+                m as i32,
+                n as i32,
+                k as i32,
+                1.0,
+                af.ptr() as *const f32,
+                k as i32,
+                wf.ptr() as *const f32,
+                k as i32,
+                beta,
+                c.ptr(),
+                n as i32,
+            )
+        };
     0
 }
 
@@ -777,20 +1096,38 @@ pub unsafe fn dr_gemm_f16(_h: *mut c_void, a: *const Half, w: *const Half, c: *m
         return 0;
     }
     let (m, n, k) = (m as usize, n as usize, k as usize);
+    let (abuf, _) = scratch_f32(m * k);
+    let (wbuf, _) = scratch_f32_w(n * k);
     let (a, w, c) = (SendPtr(a as *mut Half), SendPtr(w as *mut Half), SendPtr(c));
-    par_for!(m, |lo, hi| {
-        for r in lo..hi {
-            for cc in 0..n {
-                let mut acc = 0.0f32;
-                for j in 0..k {
-                    acc += f16_to_f32(unsafe { a.read(r * k + j) }) * f16_to_f32(unsafe { w.read(cc * k + j) });
-                }
-                unsafe {
-                    c.write(r * n + cc, acc + beta * c.read(r * n + cc));
-                }
-            }
+    let (af, wf) = (SendPtr(abuf.0.contents() as *mut f32), SendPtr(wbuf.0.contents() as *mut f32));
+    par_for!(m * k, |lo, hi| {
+        for i in lo..hi {
+            unsafe { af.write(i, f16_to_f32(a.read(i))) };
         }
     });
+    par_for!(n * k, |lo, hi| {
+        for i in lo..hi {
+            unsafe { wf.write(i, f16_to_f32(w.read(i))) };
+        }
+    });
+    unsafe {
+        cblas_sgemm(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_TRANS,
+                m as i32,
+                n as i32,
+                k as i32,
+                1.0,
+                af.ptr() as *const f32,
+                k as i32,
+                wf.ptr() as *const f32,
+                k as i32,
+                beta,
+                c.ptr(),
+                n as i32,
+            )
+        };
     0
 }
 
@@ -810,6 +1147,7 @@ pub unsafe fn dr_sample_init() -> i32 {
 /// renormalised weights; shared-expert gate logit at column E.
 pub unsafe fn dr_moe_topk(logits: *const f32, rows: i32, e: i32, topk: i32, stride: i32, idx: *mut i32, wts: *mut f32, sgate: *mut f32, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (rows, e, topk, stride) = (rows as usize, e as usize, topk as usize, stride as usize);
         for r in 0..rows {
             let l = &f32s(logits, (r + 1) * stride)[r * stride..];
@@ -832,6 +1170,7 @@ pub unsafe fn dr_moe_topk(logits: *const f32, rows: i32, e: i32, topk: i32, stri
 /// CPU: counts[e] += #{i : idx[i] == e}.
 pub unsafe fn dr_moe_count(idx: *const i32, n: i32, counts: *mut i32, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         for i in 0..n as usize {
             let e = *idx.add(i) as usize;
             *counts.add(e) += 1;
@@ -842,6 +1181,7 @@ pub unsafe fn dr_moe_count(idx: *const i32, n: i32, counts: *mut i32, st: Stream
 /// CPU: scatter bf16 rows of x into expert-sorted order.
 pub unsafe fn dr_moe_permute(idx: *const i32, rows: i32, topk: i32, offsets: *const i32, fill: *mut i32, slot_of: *mut i32, x: *const Half, xp: *mut Half, h: i32, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (rows, topk, h) = (rows as usize, topk as usize, h as usize);
         for i in 0..rows * topk {
             let e = *idx.add(i) as usize;
@@ -857,6 +1197,7 @@ pub unsafe fn dr_moe_permute(idx: *const i32, rows: i32, topk: i32, offsets: *co
 /// CPU: x[r] += sigmoid(sgate[r]) * shared[r] + sum_k w[r,k] * Y[slot_of[r,k]].
 pub unsafe fn dr_moe_combine(x: *mut f32, y: *const f32, slot_of: *const i32, wts: *const f32, sgate: *const f32, shared: *const f32, rows: i32, topk: i32, h: i32, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (rows, topk, h) = (rows as usize, topk as usize, h as usize);
         for r in 0..rows {
             let sg = sigmoid(*sgate.add(r));
@@ -936,6 +1277,7 @@ fn sample_logits(logits: &[f32], temp: f32, top_k: i32, top_p: f32, u: f32) -> u
 
 pub unsafe fn dr_sample_main(logits: *const f32, n: i32, prm: *const c_void, ras: *const i32, ras_len: i32, step: *const u64, eos: i32, sem0: i32, cb: i32, frame: *mut i32, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let p = *(prm as *const SampleParams);
         let l = f32s(logits, n as usize);
         let s = *step;
@@ -957,6 +1299,7 @@ pub unsafe fn dr_sample_main(logits: *const f32, n: i32, prm: *const c_void, ras
 
 pub unsafe fn dr_sample_head(logits: *const f32, n: i32, prm: *const c_void, stream: i32, step: *const u64, frame: *mut i32, col: i32, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let p = *(prm as *const SampleParams);
         let l = f32s(logits, n as usize);
         let u = philox_uniform(p.seed, stream as u64, *step);
@@ -967,6 +1310,7 @@ pub unsafe fn dr_sample_head(logits: *const f32, n: i32, prm: *const c_void, str
 
 pub unsafe fn dr_frame_end(next: *const i32, in_frame: *mut i32, ras: *mut i32, ras_len: i32, pos: *mut i32, step: *mut u64, hist: *mut i32, hist_len: *mut i32, hist_cap: i32, width: i32, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (ras_len, width) = (ras_len as usize, width as usize);
         for i in 0..width {
             *in_frame.add(i) = *next.add(i);
@@ -1060,6 +1404,7 @@ pub unsafe fn dr_gemv_q8(w: *const i8, s: *const Half, x: *const f32, res: *cons
 /// CPU: y[j] = silu(W[j] . norm(x)) * (W[I + j] . norm(x)).
 pub unsafe fn dr_gemv_q8_swiglu(w: *const i8, s: *const Half, x: *const f32, y: *mut f32, i: i32, k: i32, nw: *const f32, eps: f32, _pf: *const c_char, _pfb: usize, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (i, k) = (i as usize, k as usize);
         let xn = norm_fused(f32s(x, k), if nw.is_null() { None } else { Some(f32s(nw, k)) }, eps);
         let (w, s, y) = (SendPtr(w as *mut i8), SendPtr(s as *mut Half), SendPtr(y));
@@ -1077,6 +1422,7 @@ pub unsafe fn dr_gemv_q8_swiglu(w: *const i8, s: *const Half, x: *const f32, y: 
 /// CPU: router logits (fused norm) + softmax/top-k; warms nothing, resets counter.
 pub unsafe fn dr_router_topk(w: *const Half, x: *const f32, nw: *const f32, eps: f32, logits: *mut f32, e: i32, topk: i32, k: i32, idx: *mut i32, wts: *mut f32, sgate: *mut f32, counter: *mut u32, _gq: *const c_char, _gs: *const c_char, _dq: *const c_char, _ds: *const c_char, _gqb: usize, _gsb: usize, _dqb: usize, _dsb: usize, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (e, topk, k) = (e as usize, topk as usize, k as usize);
         let wv = std::slice::from_raw_parts(w, (e + 1) * k);
         let xn = norm_fused(f32s(x, k), if nw.is_null() { None } else { Some(f32s(nw, k)) }, eps);
@@ -1131,49 +1477,54 @@ pub unsafe fn dr_moe_decode(gu_q: *const u8, gu_sm: *const Half, d_q: *const u8,
         let (h, mi, topk) = (h as usize, i as usize, topk as usize);
         let k = h; // K = H = 2048 for gate_up rows
         // NOTE: gu/d weight tensors hold ALL experts ([E, ...]); rows are addressed
-        // by global expert id via raw pointers (see dot_q4_ptr).
-        let xn = norm_fused(f32s(x, k), if nw.is_null() { None } else { Some(f32s(nw, k)) }, eps);
-        // gate_up: routed experts then shared (slot topk)
-        let (gu_q, gu_sm, sgu_q, sgu_s) = (SendPtr(gu_q as *mut u8), SendPtr(gu_sm as *mut Half), SendPtr(sgu_q as *mut i8), SendPtr(sgu_s as *mut Half));
-        for kk in 0..topk {
-            let e = unsafe { *idx.add(kk) } as usize;
-            for j in 0..mi {
-                let g = unsafe { dot_q4_ptr(gu_q, gu_sm, k, e * 2 * mi + j, &xn) };
-                let u = unsafe { dot_q4_ptr(gu_q, gu_sm, k, e * 2 * mi + mi + j, &xn) };
-                unsafe { *act.add(kk * mi + j) = silu(g) * u; }
-            }
-        }
-        for j in 0..mi {
-            let g = unsafe { dot_q8_ptr(sgu_q, sgu_s, k, j, &xn) };
-            let u = unsafe { dot_q8_ptr(sgu_q, sgu_s, k, mi + j, &xn) };
-            unsafe { *act.add(topk * mi + j) = silu(g) * u; }
-        }
-        // down (rows are independent)
-        let sg = sigmoid(unsafe { *sgate.add(0) });
-        let act_shared: &[f32] = unsafe { std::slice::from_raw_parts(act.add(topk * mi), mi) };
-        let (d_q, d_sm, sd_q, sd_s) = (SendPtr(d_q as *mut u8), SendPtr(d_sm as *mut Half), SendPtr(sd_q as *mut i8), SendPtr(sd_s as *mut Half));
-        let (wts, idx, res, y, act) = (SendPtr(wts as *mut f32), SendPtr(idx as *mut i32), SendPtr(res as *mut f32), SendPtr(y), SendPtr(act));
-        par_for!(h, |lo, hi| {
-            for n in lo..hi {
-                let mut acc = 0.0f32;
-                for kk in 0..topk {
-                    let e = unsafe { idx.read(kk) } as usize;
-                    let mut qx = 0.0f32;
-                    for j in 0..mi {
-                        let aval = unsafe { act.read(kk * mi + j) };
-                        let qb = unsafe { d_q.read((e * h + n) * (mi / 2) + j / 2) };
-                        let qq = ((qb >> ((j & 1) * 4)) & 15) as f32;
-                        let g = j / 64;
-                        let s0 = unsafe { d_sm.read((e * h + n) * (mi / 64) * 2 + g * 2) };
-                        let s1 = unsafe { d_sm.read((e * h + n) * (mi / 64) * 2 + g * 2 + 1) };
-                        qx += unsafe { (qq * f16_to_f32(s0) + f16_to_f32(s1)) * aval };
-                    }
-                    acc += unsafe { wts.read(kk) } * qx;
-                }
-                let sh = unsafe { dot_q8_ptr(sd_q, sd_s, mi, n, act_shared) };
-                unsafe { y.write(n, res.read(n) + sg * sh + acc); }
-            }
-        });
+        // by global expert id inside the kernels.
+        let xv: (MBuf, u64) = if nw.is_null() {
+            require(x as *const c_void)
+        } else {
+            let (sb, soff) = scratch_f32(k);
+            let nwb = require(nw as *const c_void);
+            let xb = require(x as *const c_void);
+            let prm = NormP { rows: 1, d: k as u32, eps };
+            dispatch("rmsnorm", &[Some(xb), Some(nwb), Some((sb.clone(), soff)), None], pb(&prm), (1, 1, 1), (256, 1, 1), true);
+            (sb, soff)
+        };
+        let prm = MoeP { h: h as u32, mi: mi as u32, topk: topk as u32, k: k as u32 };
+        let nrows = (topk + 1) * mi;
+        dispatch(
+            "moe_gate_up",
+            &[
+                opt_buf(gu_q as *const c_void, 0),
+                opt_buf(gu_sm as *const c_void, 0),
+                opt_buf(sgu_q as *const c_void, 0),
+                opt_buf(sgu_s as *const c_void, 0),
+                Some(xv),
+                opt_buf(idx as *const c_void, 0),
+                opt_buf(act as *const c_void, 0),
+            ],
+            pb(&prm),
+            (nrows as u64, 1, 1),
+            (256, 1, 1),
+            true,
+        );
+        dispatch(
+            "moe_down",
+            &[
+                opt_buf(d_q as *const c_void, 0),
+                opt_buf(d_sm as *const c_void, 0),
+                opt_buf(sd_q as *const c_void, 0),
+                opt_buf(sd_s as *const c_void, 0),
+                opt_buf(act as *const c_void, 0),
+                opt_buf(idx as *const c_void, 0),
+                opt_buf(wts as *const c_void, 0),
+                opt_buf(sgate as *const c_void, 0),
+                opt_buf(res as *const c_void, 0),
+                opt_buf(y as *const c_void, 0),
+            ],
+            pb(&prm),
+            (h as u64, 1, 1),
+            (256, 1, 1),
+            true,
+        );
     })
 }
 
@@ -1185,53 +1536,51 @@ pub unsafe fn dr_moe_prefill(gu_q: *const u8, gu_sm: *const Half, d_q: *const u8
     launch(st, move || {
         let (e, h, mi) = (e as usize, h as usize, i as usize);
         let k = h; // K = 2048
-        let gq = std::slice::from_raw_parts(gu_q, e * 2 * mi * (k / 2));
-        let gs = std::slice::from_raw_parts(gu_sm, e * 2 * mi * (k / 64) * 2);
-        let dq = std::slice::from_raw_parts(d_q, e * h * (mi / 2));
-        let ds = std::slice::from_raw_parts(d_sm, e * h * (mi / 64) * 2);
-        let _ = offsets;
-        let xpv_len = (0..e).map(|ex| unsafe { *counts.add(ex) } as usize).sum::<usize>().max(1) * k;
-        let xpv = unsafe { std::slice::from_raw_parts(xp, xpv_len) };
-        let (counts, act, y) = (SendPtr(counts as *mut i32), SendPtr(act), SendPtr(y));
-        // Flatten (expert, token) pairs into uniform slots: MoE routing is
-        // skewed (a few experts own most rows), so static expert ranges would
-        // leave most threads idle. Every slot costs identical FLOPs.
-        let mut slot_expert: Vec<usize> = Vec::new();
+        // slot -> expert map (uniform-cost slots; computed once on CPU).
+        let mut se = Vec::with_capacity(1024);
         for ex in 0..e {
-            let cnt = unsafe { counts.read(ex) } as usize;
-            slot_expert.extend(std::iter::repeat(ex).take(cnt));
+            let cnt = unsafe { *counts.add(ex) } as usize;
+            se.extend(std::iter::repeat(ex as i32).take(cnt));
         }
-        let total = slot_expert.len();
-        let slot_expert: &[usize] = &slot_expert;
-        // gate_up per slot: act[slot] = silu(G_e . x) * (U_e . x) in bf16.
-        // Slots are global indices: offsets[] are prefix sums, so slot s written
-        // by expert slot_expert[s] lands exactly at act[s] / y[s].
-        par_for!(total, |lo, hi| {
-            for s in lo..hi {
-                let ex = slot_expert[s];
-                let slot = s;
-                let xr: Vec<f32> = xpv[slot * k..(slot + 1) * k].iter().map(|&v| bf16_to_f32(v)).collect();
-                for j in 0..mi {
-                    let g = dot_q4_row(gq, gs, k, ex * 2 * mi + j, &xr);
-                    let u = dot_q4_row(gq, gs, k, ex * 2 * mi + mi + j, &xr);
-                    unsafe { act.write(slot * mi + j, f32_to_bf16_rn(silu(g) * u)); }
-                }
-            }
-        });
-        // down per slot: y[slot] = D_e . act[slot] (f32).
-        par_for!(total, |lo, hi| {
-            for s in lo..hi {
-                let ex = slot_expert[s];
-                let slot = s;
-                let mut ar: Vec<f32> = Vec::with_capacity(mi);
-                for j in 0..mi {
-                    ar.push(bf16_to_f32(unsafe { act.read(slot * mi + j) }));
-                }
-                for n in 0..h {
-                    unsafe { y.write(slot * h + n, dot_q4_row(dq, ds, mi, ex * h + n, &ar)); }
-                }
-            }
-        });
+        let total = se.len();
+        if total == 0 {
+            return;
+        }
+
+        let seb = scratch_f32(total);
+        // NOTE: reuses the f32 scratch as raw bytes for the i32 slot map.
+        unsafe { std::ptr::copy_nonoverlapping(se.as_ptr(), seb.0.0.contents() as *mut i32, se.len()) };
+        let prm = MoePFP { total: total as u32, k: k as u32, mi: mi as u32, h: h as u32 };
+        dispatch(
+            "moe_pf_gate_up",
+            &[
+                opt_buf(gu_q as *const c_void, 0),
+                opt_buf(gu_sm as *const c_void, 0),
+                opt_buf(xp as *const c_void, 0),
+                Some(seb.clone()),
+                opt_buf(act as *const c_void, 0),
+            ],
+            pb(&prm),
+            (total as u64, 1, 1),
+            (256, 1, 1),
+            true,
+        );
+        
+        dispatch(
+            "moe_pf_down",
+            &[
+                opt_buf(d_q as *const c_void, 0),
+                opt_buf(d_sm as *const c_void, 0),
+                opt_buf(act as *const c_void, 0),
+                Some(seb),
+                opt_buf(y as *const c_void, 0),
+            ],
+            pb(&prm),
+            (total as u64, 1, 1),
+            (256, 1, 1),
+            true,
+        );
+
     })
 }
 
@@ -1241,6 +1590,7 @@ pub unsafe fn dr_moe_prefill(gu_q: *const u8, gu_sm: *const Half, d_q: *const u8
 /// CPU: backbone input rows (prefill gather or decode candidate lookup + codes).
 pub unsafe fn dr_embed(rows_emb: *const Half, cand_table: *const Half, frames: *const i32, fstride: i32, cb_emb: *const Half, x: *mut f32, rows: i32, d: i32, sem0: i32, sem1: i32, eos: i32, cb: i32, nb: i32, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (rows, d, fstride) = (rows as usize, d as usize, fstride as usize);
         for r in 0..rows {
             // Decode passes fstride = 0 for its single row; size the row view by use.
@@ -1281,6 +1631,7 @@ pub unsafe fn dr_embed(rows_emb: *const Half, cand_table: *const Half, frames: *
 /// CPU: tower layer input — [rms(e) | rms(h)] with label/codebook gathers.
 pub unsafe fn dr_tower_in(h: *const f32, frames: *const i32, fstride: i32, code_col: i32, in_frames: *const i32, in_stride: i32, tok_emb: *const Half, cb_emb: *const Half, enorm: *const f32, hnorm: *const f32, pre_norm: *const f32, y: *mut f32, yb: *mut Half, rows: i32, d: i32, sem0: i32, sem1: i32, cb: i32, ncb: i32, nb: i32, eps: f32, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (rows, d) = (rows as usize, d as usize);
         let (fstride, code_col) = (fstride as usize, code_col as usize);
         for r in 0..rows {
@@ -1344,6 +1695,7 @@ pub unsafe fn dr_tower_in(h: *const f32, frames: *const i32, fstride: i32, code_
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn dr_qk_norm_rope(qkv: *const f32, rs: i32, rows: i32, h: i32, hkv: i32, hd: i32, qn: *const f32, kn: *const f32, inv_freq: *const f32, rot: i32, interleaved: i32, pos_base: *const i32, pos_off: i32, q_out: *mut f32, kc: *mut Half, vc: *mut Half, eps: f32, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (rs, rows, h, hkv, hd, rot) = (rs as usize, rows as usize, h as usize, hkv as usize, hd as usize, rot as usize);
         for r in 0..rows {
             let pos = (*pos_base.add(0) + pos_off) as usize + r;
@@ -1440,6 +1792,7 @@ pub unsafe fn dr_attn_prefill(q: *const f32, kc: *const Half, vc: *const Half, g
         return 1;
     }
     launch(st, move || {
+        flush_gpu();
         let (rows, h, hkv, hd) = (rows as usize, h as usize, hkv as usize, hd as usize);
         let pos0 = (*pos_base.add(0) + pos_off) as usize;
         // KV caches are append-only and sized max_len rows; the prompt fits by construction.
@@ -1458,6 +1811,7 @@ pub unsafe fn dr_attn_decode(q: *const f32, kc: *const Half, vc: *const Half, ga
         return 1;
     }
     launch(st, move || {
+        flush_gpu();
         let (h, hkv, hd) = (h as usize, hkv as usize, hd as usize);
         let pos0 = (*pos_base.add(0) + pos_off) as usize;
         let max_keys = pos0 + 1;
@@ -1475,6 +1829,7 @@ pub unsafe fn dr_attn_decode(q: *const f32, kc: *const Half, vc: *const Half, ga
 /// CPU: causal depthwise conv (kernel 4) + SiLU; state keeps 3 inputs/channel.
 pub unsafe fn dr_conv(input: *const f32, in_stride: i32, w: *const f32, state: *mut f32, out: *mut f32, n: i32, c: i32, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (n, c, ins) = (n as usize, c as usize, in_stride as usize);
         let (input, w, state, out) = (SendPtr(input as *mut f32), SendPtr(w as *mut f32), SendPtr(state), SendPtr(out));
         par_for!(c, |lo, hi| {
@@ -1509,6 +1864,7 @@ pub unsafe fn dr_gdn(conv: *const f32, proj: *const f32, ps: i32, z_off: i32, b_
         return 1;
     }
     launch(st, move || {
+        flush_gpu();
         const DK: usize = 128;
         let (n, nk, nv) = (n as usize, nk as usize, nv as usize);
         let (ps, z_off, b_off, a_off) = (ps as usize, z_off as usize, b_off as usize, a_off as usize);
@@ -1644,6 +2000,7 @@ fn f32_to_f16_rn(v: f32) -> u16 {
 /// CPU: out[t] = sum_c table[row(c, codes[t, c])].
 pub unsafe fn dr_rvq_sum(codes: *const i32, frames: i32, ncb: i32, table: *const f32, out: *mut f32, d: i32, sem_size: i32, res_size: i32, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (frames, ncb, d) = (frames as usize, ncb as usize, d as usize);
         let (sem, res) = (sem_size as usize, res_size as usize);
         let out = SendPtr(out);
@@ -1670,6 +2027,7 @@ pub unsafe fn dr_rvq_sum(codes: *const i32, frames: i32, ncb: i32, table: *const
 /// CPU: causal im2col with optional snake -> f16.
 pub unsafe fn dr_im2col(x: *const f32, n: i32, c: i32, k: i32, d: i32, s: i32, alpha: *const f32, out: *mut Half, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (n, c, k, dil, strd) = (n as usize, c as usize, k as usize, d as isize, s as isize);
         let has_a = !alpha.is_null();
         let (x, alpha, out) = (SendPtr(x as *mut f32), SendPtr(alpha as *mut f32), SendPtr(out));
@@ -1693,6 +2051,7 @@ pub unsafe fn dr_im2col(x: *const f32, n: i32, c: i32, k: i32, d: i32, s: i32, a
 /// CPU: one residual-VQ stage per row (argmax cosine, lower-index tie-break).
 pub unsafe fn dr_vq_encode(r: *mut f32, rows: i32, d: i32, in_w: *const f32, in_b: *const f32, codebook_n: *const f32, n: i32, table: *const f32, codes: *mut i32, code_stride: i32, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (rows, d) = (rows as usize, d as usize);
         let (r, in_w, in_b, codebook_n, table, codes) = (SendPtr(r), SendPtr(in_w as *mut f32), SendPtr(in_b as *mut f32), SendPtr(codebook_n as *mut f32), SendPtr(table as *mut f32), SendPtr(codes));
         par_for!(rows, |lo, hi| {
@@ -1726,6 +2085,7 @@ pub unsafe fn dr_vq_encode(r: *mut f32, rows: i32, d: i32, in_w: *const f32, in_
 /// CPU: transposed-conv input gather ([snake(x[t]) | snake(x[t-1])]) -> f16.
 pub unsafe fn dr_tconv_gather(x: *const f32, n: i32, c: i32, two: i32, alpha: *const f32, out: *mut Half, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (n, c) = (n as usize, c as usize);
         let w = if two != 0 { 2 * c } else { c };
         let has_a = !alpha.is_null();
@@ -1749,6 +2109,7 @@ pub unsafe fn dr_tconv_gather(x: *const f32, n: i32, c: i32, two: i32, alpha: *c
 /// CPU: biased/scaled activation (+residual) -> f32 and/or f16.
 pub unsafe fn dr_epilogue(y: *const f32, n: usize, c: i32, bias: *const f32, scale: *const f32, res: *const f32, act: i32, out: *mut f32, out16: *mut Half, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let c = c as usize;
         let (y, bias, scale, res, out, out16) =
             (SendPtr(y as *mut f32), SendPtr(bias as *mut f32), SendPtr(scale as *mut f32), SendPtr(res as *mut f32), SendPtr(out), SendPtr(out16));
@@ -1781,6 +2142,7 @@ pub unsafe fn dr_epilogue(y: *const f32, n: usize, c: i32, bias: *const f32, sca
 /// CPU: depthwise causal conv + bias.
 pub unsafe fn dr_dwconv(x: *const f32, t: i32, c: i32, k: i32, w: *const f32, b: *const f32, out: *mut f32, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (t, c, k) = (t as usize, c as usize, k as usize);
         let (x, w, b, out) = (SendPtr(x as *mut f32), SendPtr(w as *mut f32), SendPtr(b as *mut f32), SendPtr(out));
         par_for!(t, |lo, hi| {
@@ -1800,6 +2162,7 @@ pub unsafe fn dr_dwconv(x: *const f32, t: i32, c: i32, k: i32, w: *const f32, b:
 /// CPU: affine LayerNorm per row -> f16.
 pub unsafe fn dr_layernorm(x: *const f32, rows: i32, c: i32, w: *const f32, b: *const f32, eps: f32, out: *mut Half, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (rows, c) = (rows as usize, c as usize);
         let (x, w, b, out) = (SendPtr(x as *mut f32), SendPtr(w as *mut f32), SendPtr(b as *mut f32), SendPtr(out));
         par_for!(rows, |lo, hi| {
@@ -1819,6 +2182,7 @@ pub unsafe fn dr_layernorm(x: *const f32, rows: i32, c: i32, w: *const f32, b: *
 /// CPU: plain-weight RMSNorm per row -> f32 and/or f16.
 pub unsafe fn dr_rmsnorm_plain(x: *const f32, rows: i32, c: i32, w: *const f32, eps: f32, out: *mut f32, out16: *mut Half, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (rows, c) = (rows as usize, c as usize);
         let (x, w, out, out16) = (SendPtr(x as *mut f32), SendPtr(w as *mut f32), SendPtr(out), SendPtr(out16));
         par_for!(rows, |lo, hi| {
@@ -1844,6 +2208,7 @@ pub unsafe fn dr_rmsnorm_plain(x: *const f32, rows: i32, c: i32, w: *const f32, 
 /// reference table) + ring KV-cache write.
 pub unsafe fn dr_codec_rope(qkv: *const f32, n: i32, h: i32, inv_freq: *const f32, t0: i32, ring: i32, q: *mut f32, kc: *mut f32, vc: *mut f32, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (n, h) = (n as usize, h as usize);
         let w = h * 64;
         let (qkv, inv_freq, q, kc, vc) = (SendPtr(qkv as *mut f32), SendPtr(inv_freq as *mut f32), SendPtr(q), SendPtr(kc), SendPtr(vc));
@@ -1880,6 +2245,7 @@ pub unsafe fn dr_codec_rope(qkv: *const f32, n: i32, h: i32, inv_freq: *const f3
 /// CPU: causal windowed attention over the ring caches, head_dim 64 -> f16.
 pub unsafe fn dr_codec_attn(q: *const f32, kc: *const f32, vc: *const f32, n: i32, h: i32, window: i32, t0: i32, ring: i32, out: *mut Half, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (n, h) = (n as usize, h as usize);
         let w = h * 64;
         let (q, kc, vc, out) = (SendPtr(q as *mut f32), SendPtr(kc as *mut f32), SendPtr(vc as *mut f32), SendPtr(out));
@@ -1919,6 +2285,7 @@ pub unsafe fn dr_codec_attn(q: *const f32, kc: *const f32, vc: *const f32, n: i3
 /// CPU: y[t, j] = silu(h[t, j]) * h[t, I + j] -> f16.
 pub unsafe fn dr_swiglu16(h: *const f32, y: *mut Half, rows: i32, i: i32, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (rows, ii) = (rows as usize, i as usize);
         let (h, y) = (SendPtr(h as *mut f32), SendPtr(y));
         par_for!(rows, |lo, hi| {
@@ -1936,6 +2303,7 @@ pub unsafe fn dr_swiglu16(h: *const f32, y: *mut Half, rows: i32, i: i32, st: St
 /// CPU: final layer — tanh over the snake-activated causal conv.
 pub unsafe fn dr_conv_out(x: *const f32, n: i32, c: i32, k: i32, alpha: *const f32, w: *const f32, b: *const f32, out: *mut f32, st: Stream) -> i32 {
     launch(st, move || {
+        flush_gpu();
         let (n, c, k) = (n as usize, c as usize, k as usize);
         let (x, alpha, w, b, out) = (SendPtr(x as *mut f32), SendPtr(alpha as *mut f32), SendPtr(w as *mut f32), SendPtr(b as *mut f32), SendPtr(out));
         par_for!(n, |lo, hi| {

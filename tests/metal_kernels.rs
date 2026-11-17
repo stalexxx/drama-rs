@@ -376,3 +376,271 @@ fn gemv_q8_matches_cpu() {
     gemv_q8_case(17, 512, true, false);
     gemv_q8_case(9, 4096, false, true);
 }
+
+fn dot_q4_test(q: &[u8], sm: &[u16], k: usize, row: usize, x: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    for j in 0..k {
+        let qq = ((q[row * (k / 2) + j / 2] >> ((j & 1) * 4)) & 15) as f32;
+        let g = j / 64;
+        acc += (qq * f16_test(sm[row * (k / 64) * 2 + g * 2]) + f16_test(sm[row * (k / 64) * 2 + g * 2 + 1])) * x[j];
+    }
+    acc
+}
+
+fn dot_q8_test(q: &[i8], s: &[u16], k: usize, row: usize, x: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    for j in 0..k {
+        acc += q[row * k + j] as f32 * f16_test(s[row * (k / 128) + j / 128]) * x[j];
+    }
+    acc
+}
+
+fn f16_test(h: u16) -> f32 {
+    let s = (h & 0x8000) as u32;
+    let e = (h & 0x7c00) as u32;
+    let m = (h & 0x03ff) as u32;
+    let bits = if e == 0 {
+        if m == 0 {
+            s << 16
+        } else {
+            (s << 16) | 0x38000000
+        }
+    } else if e == 0x7c00 {
+        (s << 16) | 0x7f800000
+    } else {
+        (s << 16) | (((e >> 10) + 112) << 23) | (m << 13)
+    };
+    f32::from_bits(bits)
+}
+
+#[test]
+fn moe_decode_matches_cpu() {
+    let s = st();
+    // real engine dims, 4 experts (ids 0..3)
+    const H: usize = 2048;
+    const MI: usize = 512;
+    const TOPK: usize = 8;
+    const E: usize = 4;
+    let mut rng = Rng(0x1234abcd);
+    let mut rbytes = |n: usize| -> Vec<u8> { (0..n).map(|_| (rng.next() % 256) as u8).collect() };
+    // gate_up q4 [E, 2*MI, K/2], K=H=2048
+    let gq = rbytes(E * 2 * MI * 1024);
+    let gs: Vec<u16> = (0..E * 2 * MI * 32 * 2).map(|i| f16_bits_test(0.03 * (1.0 + (i % 5) as f32 * 0.1))).collect();
+    let dq = rbytes(E * H * 256);
+    let ds: Vec<u16> = (0..E * H * 8 * 2).map(|i| f16_bits_test(0.03 * (1.0 + (i % 5) as f32 * 0.1))).collect();
+    // shared int8: [2*MI, K] and [H, MI]
+    let sgq: Vec<i8> = (0..2 * MI * H).map(|_| (rng.next() % 256) as u8 as i8).collect();
+    let sgs: Vec<u16> = (0..2 * MI * 16).map(|i| f16_bits_test(0.02 * (1.0 + (i % 5) as f32 * 0.1))).collect();
+    let sdq: Vec<i8> = (0..H * MI).map(|_| (rng.next() % 256) as u8 as i8).collect();
+    let sds: Vec<u16> = (0..H * 4).map(|i| f16_bits_test(0.02 * (1.0 + (i % 5) as f32 * 0.1))).collect();
+    let x: Vec<f32> = (0..H).map(|_| rng.f32()).collect();
+    let nw: Vec<f32> = (0..H).map(|_| 0.5 + rng.f32().abs()).collect();
+    let idx: Vec<i32> = vec![3, 0, 2, 1, 0, 2, 1, 3];
+    let wts: Vec<f32> = vec![0.2, 0.15, 0.15, 0.1, 0.1, 0.1, 0.1, 0.1];
+    let sgate = vec![0.3f32];
+    let res: Vec<f32> = (0..H).map(|_| rng.f32() * 0.5).collect();
+    let up = |d: &[u8]| alloc(d.len(), s, Some(d));
+    let gqp = up(&gq);
+    let gsp = up(&bytes_of(&gs));
+    let dqp = up(&dq);
+    let dsp = up(&bytes_of(&ds));
+    let sgqp = up(&bytes_of(&sgq));
+    let sgsp = up(&bytes_of(&sgs));
+    let sdqp = up(&bytes_of(&sdq));
+    let sdsp = up(&bytes_of(&sds));
+    let xp = up(&bytes_of(&x));
+    let nwp = up(&bytes_of(&nw));
+    let idxp = up(&bytes_of(&idx));
+    let wtsp = up(&bytes_of(&wts));
+    let sgp = up(&bytes_of(&sgate));
+    let resp = up(&bytes_of(&res));
+    let actp = up(&vec![0u8; (TOPK + 1) * MI * 4]);
+    let yp = up(&vec![0u8; H * 4]);
+    assert_eq!(
+        unsafe {
+            ffi::dr_moe_decode(
+                gqp as *const u8, gsp as *const u16, dqp as *const u8, dsp as *const u16,
+                sgqp as *const i8, sgsp as *const u16, sdqp as *const i8, sdsp as *const u16,
+                xp as *const f32, idxp as *const i32, wtsp as *const f32, sgp as *const f32,
+                resp as *const f32, actp as *mut f32, yp as *mut f32,
+                H as i32, MI as i32, TOPK as i32, nwp as *const f32, 1e-5, std::ptr::null(), 0, s,
+            )
+        },
+        0
+    );
+    let y: Vec<f32> = down(yp, H, s);
+    // CPU oracle
+    let inv = (x.iter().map(|v| v * v).sum::<f32>() / H as f32 + 1e-5).sqrt().recip();
+    let xn: Vec<f32> = x.iter().zip(nw.iter()).map(|(a, b)| a * inv * b).collect();
+    let q4 = |q: &[u8], sm: &[u16], k: usize, row: usize| dot_q4_test(q, sm, k, row, &xn);
+    let q8 = |q: &[i8], sm: &[u16], k: usize, row: usize| dot_q8_test(q, sm, k, row, &xn);
+    let mut act = vec![0.0f32; (TOPK + 1) * MI];
+    for kk in 0..TOPK {
+        let e = idx[kk] as usize;
+        for j in 0..MI {
+            let g = q4(&gq, &gs, H, e * 2 * MI + j);
+            let u = q4(&gq, &gs, H, e * 2 * MI + MI + j);
+            act[kk * MI + j] = g / (1.0 + (-g).exp()) * u;
+        }
+    }
+    for j in 0..MI {
+        let g = q8(&sgq, &sgs, H, j);
+        let u = q8(&sgq, &sgs, H, MI + j);
+        act[TOPK * MI + j] = g / (1.0 + (-g).exp()) * u;
+    }
+    let sg = 1.0 / (1.0 + (-sgate[0]).exp());
+    let mut want = vec![0.0f32; H];
+    for n in 0..H {
+        let mut acc = 0.0f32;
+        for kk in 0..TOPK {
+            let e = idx[kk] as usize;
+            let mut qx = 0.0f32;
+            for j in 0..MI {
+                let qb = dq[(e * H + n) * (MI / 2) + j / 2];
+                let qq = ((qb >> ((j & 1) * 4)) & 15) as f32;
+                let g = j / 64;
+                qx += (qq * f16_test(ds[(e * H + n) * (MI / 64) * 2 + g * 2]) + f16_test(ds[(e * H + n) * (MI / 64) * 2 + g * 2 + 1])) * act[kk * MI + j];
+            }
+            acc += wts[kk] * qx;
+        }
+        let mut sh = 0.0f32;
+        for j in 0..MI {
+            sh += sdq[n * MI + j] as f32 * f16_test(sds[n * (MI / 128) + j / 128]) * act[TOPK * MI + j];
+        }
+        want[n] = res[n] + sg * sh + acc;
+    }
+    for n in 0..H {
+        assert!((y[n] - want[n]).abs() < 1e-1 * want[n].abs().max(1.0), "row {n}: {} vs {}", y[n], want[n]);
+    }
+}
+
+fn bf16_test(v: f32) -> u16 {
+    let b = v.to_bits();
+    if (b & 0x7f80_0000) == 0x7f80_0000 && (b & 0x007f_ffff) != 0 {
+        return 0x7fc0;
+    }
+    (((b + 0x7fff + ((b >> 16) & 1)) >> 16)) as u16
+}
+
+#[test]
+fn gemm_matches_cpu() {
+    let s = st();
+    let mut rng = Rng(0x6e6d);
+    for (m, n, k) in [(2usize, 3, 4), (17, 65, 129), (64, 128, 256)] {
+        let a: Vec<u16> = (0..m * k).map(|_| bf16_test(rng.f32())).collect();
+        let w: Vec<u16> = (0..n * k).map(|_| bf16_test(rng.f32())).collect();
+        let ap = alloc(a.len() * 2, s, Some(&bytes_of(&a)));
+        let wp = alloc(w.len() * 2, s, Some(&bytes_of(&w)));
+        let cp = alloc(m * n * 4, s, None);
+        assert_eq!(unsafe { ffi::dr_gemm(std::ptr::null_mut(), ap as *const u16, wp as *const u16, cp as *mut f32, m as i32, n as i32, k as i32, 0.0) }, 0);
+        let c: Vec<f32> = down(cp, m * n, s);
+        for r in 0..m {
+            for cc in 0..n {
+                let mut wantb = 0.0f32;
+                for j in 0..k {
+                    wantb += bf16_test_f32(a[r * k + j]) * bf16_test_f32(w[cc * k + j]);
+                }
+                assert!((c[r * n + cc] - wantb).abs() < 1e-3 * wantb.abs().max(1.0), "m={m} n={n} k={k} ({r},{cc}): {} vs {wantb}", c[r * n + cc]);
+            }
+        }
+    }
+}
+
+fn bf16_test_f32(h: u16) -> f32 {
+    f32::from_bits((h as u32) << 16)
+}
+
+#[test]
+fn moe_prefill_matches_cpu() {
+    let s = st();
+    const H: usize = 2048;
+    let e: usize = std::env::var("MOE_EXPERTS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    const MI: usize = 512;
+    
+    let mut rng = Rng(0x9f17);
+    let rbytes = |n: usize| -> Vec<u8> { let mut r = Rng(0xbeef); (0..n).map(|_| (r.next() % 256) as u8).collect() };
+    let gq = rbytes(e * 2 * MI * 1024);
+    let gs: Vec<u16> = (0..e * 2 * MI * 32 * 2).map(|i| f16_bits_test(0.03 * (1.0 + (i % 5) as f32 * 0.1))).collect();
+    let dq = rbytes(e * H * 256);
+    let ds: Vec<u16> = (0..e * H * 8 * 2).map(|i| f16_bits_test(0.03 * (1.0 + (i % 5) as f32 * 0.1))).collect();
+    let total: usize = std::env::var("MOE_SLOTS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let se0: Vec<usize> = (0..total).map(|s| s * e / total.max(1)).collect();
+    let counts: Vec<i32> = { let mut c = vec![0i32; e]; for &sx in &se0 { c[sx] += 1; } c };
+    let xp: Vec<u16> = (0..total * H).map(|_| bf16_test(rng.f32())).collect();
+    let offs: Vec<i32> = { let mut o = vec![0i32]; for &c in &counts { o.push(o.last().unwrap() + c); } o };
+    let up = |d: &[u8]| alloc(d.len(), s, Some(d));
+    let gqp = up(&gq);
+    let gsp = up(&bytes_of(&gs));
+    let dqp = up(&dq);
+    let dsp = up(&bytes_of(&ds));
+    let xpp = up(&bytes_of(&xp));
+    let offp = up(&bytes_of(&offs));
+    let cntp = up(&bytes_of(&counts));
+    let actp = up(&vec![0u8; total * MI * 2]);
+    let yp = up(&vec![0u8; total * H * 4]);
+    assert_eq!(
+        unsafe {
+            ffi::dr_moe_prefill(
+                gqp as *const u8, gsp as *const u16, dqp as *const u8, dsp as *const u16,
+                xpp as *const u16, offp as *const i32, cntp as *const i32,
+                actp as *mut u16, yp as *mut f32, e as i32, H as i32, MI as i32, s,
+            )
+        },
+        0
+    );
+    let y: Vec<f32> = down(yp, total * H, s);
+    let actb: Vec<u8> = down(actp, total * MI * 2, s);
+    let act: Vec<u16> = actb.chunks(2).map(|c| u16::from_ne_bytes([c[0], c[1]])).collect();
+    // CPU oracle
+    let se: Vec<usize> = se0;
+    let bf = |h: u16| f32::from_bits((h as u32) << 16);
+    let mut want_a = vec![0u16; total * MI];
+    let mut want_y = vec![0f32; total * H];
+    for sl in 0..total {
+        let ex = se[sl];
+        let xr: Vec<f32> = (0..H).map(|t| bf(xp[sl * H + t])).collect();
+        for j in 0..MI {
+            let g = dot_q4_test(&gq, &gs, H, ex * 2 * MI + j, &xr);
+            let u = dot_q4_test(&gq, &gs, H, ex * 2 * MI + MI + j, &xr);
+            let v = g / (1.0 + (-g).exp()) * u;
+            want_a[sl * MI + j] = bf16_test(v);
+        }
+        let ar: Vec<f32> = (0..MI).map(|j| bf(want_a[sl * MI + j])).collect();
+        for n in 0..H {
+            want_y[sl * H + n] = dot_q4_test(&dq, &ds, MI, ex * H + n, &ar);
+        }
+    }
+    for sl in 0..total {
+        for j in 0..MI {
+            let got = bf(act[sl * MI + j]);
+            let want = bf(want_a[sl * MI + j]);
+            assert!((got - want).abs() < 0.02 * want.abs().max(1.0), "act ({sl},{j}): {got} vs {want}");
+        }
+        for n in (0..H).step_by(7) {
+            assert!((y[sl * H + n] - want_y[sl * H + n]).abs() < 0.02 * want_y[sl * H + n].abs().max(1.0), "y ({sl},{n})");
+        }
+    }
+}
+
+#[test]
+fn sgemm_determinism() {
+    let s = st();
+    let mut rng = Rng(0xde7);
+    let (m, n, k) = (16usize, 1024, 3072);
+    let a: Vec<u16> = (0..m * k).map(|_| bf16_test(rng.f32())).collect();
+    let w: Vec<u16> = (0..n * k).map(|_| bf16_test(rng.f32())).collect();
+    let ap = alloc(a.len() * 2, s, Some(&bytes_of(&a)));
+    let wp = alloc(w.len() * 2, s, Some(&bytes_of(&w)));
+    let cp = alloc(m * n * 4, s, None);
+    let mut first: Vec<f32> = Vec::new();
+    for it in 0..500 {
+        assert_eq!(unsafe { ffi::dr_gemm_f16(std::ptr::null_mut(), ap as *const u16, wp as *const u16, cp as *mut f32, m as i32, n as i32, k as i32, 0.0) }, 0);
+        let c: Vec<f32> = down(cp, m * n, s);
+        assert!(c.iter().all(|v| v.is_finite()), "iter {it}: non-finite");
+        if it == 0 {
+            first = c;
+        } else {
+            assert!(c == first, "iter {it}: nondeterministic sgemm!");
+        }
+    }
+}
