@@ -683,9 +683,28 @@ pub unsafe fn dr_gemm(_h: *mut c_void, a: *const Half, w: *const Half, c: *mut f
     0
 }
 
-pub unsafe fn dr_gemm_f16(_h: *mut c_void, _a: *const Half, _w: *const Half, _c: *mut f32, _m: i32, _n: i32, _k: i32, _beta: f32) -> i32 {
-    // Codec-only in the current engine; the codec is not ported yet.
-    unported()
+/// CPU: C[m, n] = A[m, k] . W[n, k]^T + beta * C (f16 inputs, f32 output).
+pub unsafe fn dr_gemm_f16(_h: *mut c_void, a: *const Half, w: *const Half, c: *mut f32, m: i32, n: i32, k: i32, beta: f32) -> i32 {
+    if m <= 0 || n <= 0 || k <= 0 {
+        return 0;
+    }
+    let (m, n, k) = (m as usize, n as usize, k as usize);
+    let av = std::slice::from_raw_parts(a, m * k);
+    let wv = std::slice::from_raw_parts(w, n * k);
+    let cv = std::slice::from_raw_parts_mut(c, m * n);
+    for r in 0..m {
+        for cc in 0..n {
+            let mut acc = 0.0f32;
+            let arow = &av[r * k..(r + 1) * k];
+            let wrow = &wv[cc * k..(cc + 1) * k];
+            for j in 0..k {
+                acc += f16_to_f32(arow[j]) * f16_to_f32(wrow[j]);
+            }
+            let o = &mut cv[r * n + cc];
+            *o = acc + beta * *o;
+        }
+    }
+    0
 }
 
 pub unsafe fn dr_attn_part_floats() -> i32 {
@@ -884,11 +903,7 @@ pub unsafe fn dr_frame_end(next: *const i32, in_frame: *mut i32, ras: *mut i32, 
 }
 
 // ---------------------------------------------------------------------------
-// not yet ported: same error convention as the stage-1 stubs
-
-fn unported() -> i32 {
-    1
-}
+// (every dr_* above is implemented; nothing routes to unported() anymore)
 
 // ---------------------------------------------------------------------------
 // CPU reference: quantised GEMV (decode)
@@ -1424,55 +1439,331 @@ pub unsafe fn dr_gdn(conv: *const f32, proj: *const f32, ps: i32, z_off: i32, b_
 }
 
 // ---------------------------------------------------------------------------
-// codec (kernels/codec.cu): not ported yet.
-// `speak`/`decode`/`encode` fail with a clear error until these land.
+// ---------------------------------------------------------------------------
+// CPU reference: codec (kernels/codec.cu). Activations are time-major [T, C].
+// `x` may point into a buffer with readable history rows before it (causal
+// convs), so negative offsets are valid and handled with raw arithmetic.
 
-pub unsafe fn dr_rvq_sum(_codes: *const i32, _frames: i32, _ncb: i32, _table: *const f32, _out: *mut f32, _d: i32, _sem: i32, _res: i32, _st: Stream) -> i32 {
-    unported()
+fn snake(x: f32, a: f32) -> f32 {
+    let s = (a * x).sin();
+    x + s * s / (a + 1e-9)
 }
 
-pub unsafe fn dr_im2col(_x: *const f32, _n: i32, _c: i32, _k: i32, _d: i32, _s: i32, _alpha: *const f32, _out: *mut Half, _st: Stream) -> i32 {
-    unported()
+fn erf_approx(x: f32) -> f32 {
+    // Abramowitz & Stegun 7.1.26, |err| <= 1.5e-7.
+    const A1: f32 = 0.254829592;
+    const A2: f32 = -0.284496736;
+    const A3: f32 = 1.421413741;
+    const A4: f32 = -1.453152027;
+    const A5: f32 = 1.061405429;
+    const P: f32 = 0.3275911;
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs();
+    let t = 1.0 / (1.0 + P * x);
+    let y = 1.0 - (((((A5 * t + A4) * t) + A3) * t + A2) * t + A1) * t * (-x * x).exp();
+    sign * y
 }
 
-pub unsafe fn dr_vq_encode(_r: *mut f32, _rows: i32, _d: i32, _in_w: *const f32, _in_b: *const f32, _cbn: *const f32, _n: i32, _table: *const f32, _codes: *mut i32, _cs: i32, _st: Stream) -> i32 {
-    unported()
+fn gelu_erf(v: f32) -> f32 {
+    0.5 * v * (1.0 + erf_approx(v * 0.70710678118654752))
 }
 
-pub unsafe fn dr_tconv_gather(_x: *const f32, _n: i32, _c: i32, _two: i32, _alpha: *const f32, _out: *mut Half, _st: Stream) -> i32 {
-    unported()
+/// Round-to-nearest-even f32 -> f16 bits (matches `__float2half`).
+fn f32_to_f16_rn(v: f32) -> u16 {
+    let b = v.to_bits();
+    let s = (b >> 16) & 0x8000;
+    let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    let m = b & 0x7fffff;
+    if e <= 0 {
+        if e < -10 {
+            return s as u16;
+        }
+        let m = m | 0x800000;
+        let shift = (1 - e) as u32;
+        let mut out = m >> shift;
+        let rest = m & ((1 << shift) - 1);
+        let half = 1 << (shift - 1);
+        if rest > half || (rest == half && (out & 1) == 1) {
+            out += 1;
+        }
+        return (s | out) as u16;
+    }
+    if e >= 31 {
+        return if m == 0 { (s | 0x7c00) as u16 } else { (s | 0x7e00) as u16 };
+    }
+    let m = m + 0xfff + ((m >> 13) & 1);
+    if m >= 0x800000 {
+        return (s | ((e as u32 + 1) << 10)) as u16;
+    }
+    (s | ((e as u32) << 10) | (m >> 13)) as u16
 }
 
-pub unsafe fn dr_epilogue(_y: *const f32, _n: usize, _c: i32, _bias: *const f32, _scale: *const f32, _res: *const f32, _act: i32, _out: *mut f32, _o16: *mut Half, _st: Stream) -> i32 {
-    unported()
+/// CPU: out[t] = sum_c table[row(c, codes[t, c])].
+pub unsafe fn dr_rvq_sum(codes: *const i32, frames: i32, ncb: i32, table: *const f32, out: *mut f32, d: i32, sem_size: i32, res_size: i32, st: Stream) -> i32 {
+    launch(st, move || {
+        let (frames, ncb, d) = (frames as usize, ncb as usize, d as usize);
+        let (sem, res) = (sem_size as usize, res_size as usize);
+        for t in 0..frames {
+            let orow = std::slice::from_raw_parts_mut(out.add(t * d), d);
+            orow.fill(0.0);
+            for c in 0..ncb {
+                let size = if c == 0 { sem } else { res };
+                let code = (*codes.add(t * ncb + c)).clamp(0, size as i32 - 1) as usize;
+                let row = if c == 0 { code } else { sem + (c - 1) * res + code };
+                let tr = std::slice::from_raw_parts(table.add(row * d), d);
+                for (o, &v) in orow.iter_mut().zip(tr.iter()) {
+                    *o += v;
+                }
+            }
+        }
+    })
 }
 
-pub unsafe fn dr_dwconv(_x: *const f32, _t: i32, _c: i32, _k: i32, _w: *const f32, _b: *const f32, _out: *mut f32, _st: Stream) -> i32 {
-    unported()
+/// CPU: causal im2col with optional snake -> f16.
+pub unsafe fn dr_im2col(x: *const f32, n: i32, c: i32, k: i32, d: i32, s: i32, alpha: *const f32, out: *mut Half, st: Stream) -> i32 {
+    launch(st, move || {
+        let (n, c, k, dil, strd) = (n as usize, c as usize, k as usize, d as isize, s as isize);
+        let has_a = !alpha.is_null();
+        for i in 0..n * k * c {
+            let cc = i % c;
+            let tj = i / c;
+            let j = (tj % k) as isize;
+            let t = (tj / k) as isize;
+            let src = t * strd + (strd - 1) - ((k as isize - 1 - j) * dil);
+            let mut v = *x.offset(src * c as isize + cc as isize);
+            if has_a {
+                v = snake(v, *alpha.add(cc));
+            }
+            *out.add(i) = f32_to_f16_rn(v);
+        }
+    })
 }
 
-pub unsafe fn dr_layernorm(_x: *const f32, _rows: i32, _c: i32, _w: *const f32, _b: *const f32, _eps: f32, _out: *mut Half, _st: Stream) -> i32 {
-    unported()
+/// CPU: one residual-VQ stage per row (argmax cosine, lower-index tie-break).
+pub unsafe fn dr_vq_encode(r: *mut f32, rows: i32, d: i32, in_w: *const f32, in_b: *const f32, codebook_n: *const f32, n: i32, table: *const f32, codes: *mut i32, code_stride: i32, st: Stream) -> i32 {
+    launch(st, move || {
+        let (rows, d) = (rows as usize, d as usize);
+        for row in 0..rows {
+            let rr = std::slice::from_raw_parts_mut(r.add(row * d), d);
+            let mut z = [0.0f32; 8];
+            for o in 0..8 {
+                let wr = std::slice::from_raw_parts(in_w.add(o * d), d);
+                z[o] = wr.iter().zip(rr.iter()).map(|(a, b)| a * b).sum::<f32>() + *in_b.add(o);
+            }
+            let mut best = 0i32;
+            let mut bv = f32::NEG_INFINITY;
+            for e in 0..n as usize {
+                let er = std::slice::from_raw_parts(codebook_n.add(e * 8), 8);
+                let dot: f32 = z.iter().zip(er.iter()).map(|(a, b)| a * b).sum();
+                if dot > bv {
+                    bv = dot;
+                    best = e as i32;
+                }
+            }
+            let tr = std::slice::from_raw_parts(table.add(best as usize * d), d);
+            for (a, &b) in rr.iter_mut().zip(tr.iter()) {
+                *a -= b;
+            }
+            *codes.add(row * code_stride as usize) = best;
+        }
+    })
 }
 
-pub unsafe fn dr_rmsnorm_plain(_x: *const f32, _rows: i32, _c: i32, _w: *const f32, _eps: f32, _out: *mut f32, _o16: *mut Half, _st: Stream) -> i32 {
-    unported()
+/// CPU: transposed-conv input gather ([snake(x[t]) | snake(x[t-1])]) -> f16.
+pub unsafe fn dr_tconv_gather(x: *const f32, n: i32, c: i32, two: i32, alpha: *const f32, out: *mut Half, st: Stream) -> i32 {
+    launch(st, move || {
+        let (n, c) = (n as usize, c as usize);
+        let w = if two != 0 { 2 * c } else { c };
+        let has_a = !alpha.is_null();
+        for i in 0..n * w {
+            let t = (i / w) as isize;
+            let cc = i % w;
+            let ch = cc % c;
+            let src = if cc < c { t } else { t - 1 };
+            let mut v = *x.offset(src * c as isize + ch as isize);
+            if has_a {
+                v = snake(v, *alpha.add(ch));
+            }
+            *out.add(i) = f32_to_f16_rn(v);
+        }
+    })
 }
 
-pub unsafe fn dr_codec_rope(_qkv: *const f32, _n: i32, _h: i32, _inv: *const f32, _t0: i32, _ring: i32, _q: *mut f32, _kc: *mut f32, _vc: *mut f32, _st: Stream) -> i32 {
-    unported()
+/// CPU: biased/scaled activation (+residual) -> f32 and/or f16.
+pub unsafe fn dr_epilogue(y: *const f32, n: usize, c: i32, bias: *const f32, scale: *const f32, res: *const f32, act: i32, out: *mut f32, out16: *mut Half, st: Stream) -> i32 {
+    launch(st, move || {
+        let c = c as usize;
+        for i in 0..n {
+            let cc = i % c;
+            let mut v = *y.add(i) + if bias.is_null() { 0.0 } else { *bias.add(cc) };
+            if act == 1 {
+                v = v.tanh();
+            } else if act == 2 {
+                v = gelu_erf(v);
+            }
+            if !scale.is_null() {
+                v *= *scale.add(cc);
+            }
+            if !res.is_null() {
+                v += *res.add(i);
+            }
+            if !out.is_null() {
+                *out.add(i) = v;
+            }
+            if !out16.is_null() {
+                *out16.add(i) = f32_to_f16_rn(v);
+            }
+        }
+    })
 }
 
-pub unsafe fn dr_codec_attn(_q: *const f32, _kc: *const f32, _vc: *const f32, _n: i32, _h: i32, _win: i32, _t0: i32, _ring: i32, _out: *mut Half, _st: Stream) -> i32 {
-    unported()
+/// CPU: depthwise causal conv + bias.
+pub unsafe fn dr_dwconv(x: *const f32, t: i32, c: i32, k: i32, w: *const f32, b: *const f32, out: *mut f32, st: Stream) -> i32 {
+    launch(st, move || {
+        let (t, c, k) = (t as usize, c as usize, k as usize);
+        for tt in 0..t {
+            for cc in 0..c {
+                let mut acc = *b.add(cc);
+                for j in 0..k {
+                    acc += *w.add(cc * k + j) * *x.offset((tt as isize - (k - 1 - j) as isize) * c as isize + cc as isize);
+                }
+                *out.add(tt * c + cc) = acc;
+            }
+        }
+    })
 }
 
-pub unsafe fn dr_swiglu16(_h: *const f32, _y: *mut Half, _rows: i32, _i: i32, _st: Stream) -> i32 {
-    unported()
+/// CPU: affine LayerNorm per row -> f16.
+pub unsafe fn dr_layernorm(x: *const f32, rows: i32, c: i32, w: *const f32, b: *const f32, eps: f32, out: *mut Half, st: Stream) -> i32 {
+    launch(st, move || {
+        let (rows, c) = (rows as usize, c as usize);
+        for r in 0..rows {
+            let xr = std::slice::from_raw_parts(x.add(r * c), c);
+            let mean = xr.iter().sum::<f32>() / c as f32;
+            let inv = (xr.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / c as f32 + eps).sqrt().recip();
+            for i in 0..c {
+                *out.add(r * c + i) = f32_to_f16_rn((xr[i] - mean) * inv * *w.add(i) + *b.add(i));
+            }
+        }
+    })
 }
 
-pub unsafe fn dr_conv_out(_x: *const f32, _n: i32, _c: i32, _k: i32, _alpha: *const f32, _w: *const f32, _b: *const f32, _out: *mut f32, _st: Stream) -> i32 {
-    unported()
+/// CPU: plain-weight RMSNorm per row -> f32 and/or f16.
+pub unsafe fn dr_rmsnorm_plain(x: *const f32, rows: i32, c: i32, w: *const f32, eps: f32, out: *mut f32, out16: *mut Half, st: Stream) -> i32 {
+    launch(st, move || {
+        let (rows, c) = (rows as usize, c as usize);
+        for r in 0..rows {
+            let xr = std::slice::from_raw_parts(x.add(r * c), c);
+            let inv = rms_inv(xr, eps);
+            for i in 0..c {
+                let v = xr[i] * inv * *w.add(i);
+                if !out.is_null() {
+                    *out.add(r * c + i) = v;
+                }
+                if !out16.is_null() {
+                    *out16.add(r * c + i) = f32_to_f16_rn(v);
+                }
+            }
+        }
+    })
+}
+
+/// CPU: codec qkv split + interleaved rope (cos/sin rounded via bf16, like the
+/// reference table) + ring KV-cache write.
+pub unsafe fn dr_codec_rope(qkv: *const f32, n: i32, h: i32, inv_freq: *const f32, t0: i32, ring: i32, q: *mut f32, kc: *mut f32, vc: *mut f32, st: Stream) -> i32 {
+    launch(st, move || {
+        let (n, h) = (n as usize, h as usize);
+        let w = h * 64;
+        for r in 0..n {
+            let t = t0 as usize + r;
+            let slot = (t % ring as usize) * w;
+            for i in 0..w / 2 {
+                let head = i / 32;
+                let p = i % 32;
+                let (sn, cs) = (t as f32 * *inv_freq.add(p)).sin_cos();
+                let c = bf16_to_f32(f32_to_bf16_rn(cs));
+                let s = bf16_to_f32(f32_to_bf16_rn(sn));
+                let base = r * 3 * w;
+                let e = head * 64 + 2 * p;
+                let q0 = *qkv.add(base + e);
+                let q1 = *qkv.add(base + e + 1);
+                let k0 = *qkv.add(base + w + e);
+                let k1 = *qkv.add(base + w + e + 1);
+                *q.add(r * w + e) = q0 * c - q1 * s;
+                *q.add(r * w + e + 1) = q1 * c + q0 * s;
+                *kc.add(slot + e) = k0 * c - k1 * s;
+                *kc.add(slot + e + 1) = k1 * c + k0 * s;
+                *vc.add(slot + e) = *qkv.add(base + 2 * w + e);
+                *vc.add(slot + e + 1) = *qkv.add(base + 2 * w + e + 1);
+            }
+        }
+    })
+}
+
+/// CPU: causal windowed attention over the ring caches, head_dim 64 -> f16.
+pub unsafe fn dr_codec_attn(q: *const f32, kc: *const f32, vc: *const f32, n: i32, h: i32, window: i32, t0: i32, ring: i32, out: *mut Half, st: Stream) -> i32 {
+    launch(st, move || {
+        let (n, h) = (n as usize, h as usize);
+        let w = h * 64;
+        for r in 0..n {
+            let t = t0 as usize + r;
+            let start = t.saturating_sub(window as usize - 1);
+            for hh in 0..h {
+                let mut m = f32::NEG_INFINITY;
+                let mut l = 0.0f32;
+                let mut acc = [0.0f32; 64];
+                for j in start..=t {
+                    let at = (j % ring as usize) * w + hh * 64;
+                    let mut s = 0.0f32;
+                    for dd in 0..64 {
+                        s += *q.add(r * w + hh * 64 + dd) * *kc.add(at + dd);
+                    }
+                    s *= 0.125;
+                    let mn = m.max(s);
+                    let corr = (m - mn).exp();
+                    let p = (s - mn).exp();
+                    l = l * corr + p;
+                    for dd in 0..64 {
+                        acc[dd] = acc[dd] * corr + p * *vc.add(at + dd);
+                    }
+                    m = mn;
+                }
+                for dd in 0..64 {
+                    *out.add(r * w + hh * 64 + dd) = f32_to_f16_rn(acc[dd] / l);
+                }
+            }
+        }
+    })
+}
+
+/// CPU: y[t, j] = silu(h[t, j]) * h[t, I + j] -> f16.
+pub unsafe fn dr_swiglu16(h: *const f32, y: *mut Half, rows: i32, i: i32, st: Stream) -> i32 {
+    launch(st, move || {
+        let (rows, ii) = (rows as usize, i as usize);
+        for r in 0..rows {
+            for j in 0..ii {
+                let g = *h.add(r * 2 * ii + j);
+                let u = *h.add(r * 2 * ii + ii + j);
+                *y.add(r * ii + j) = f32_to_f16_rn(silu(g) * u);
+            }
+        }
+    })
+}
+
+/// CPU: final layer — tanh over the snake-activated causal conv.
+pub unsafe fn dr_conv_out(x: *const f32, n: i32, c: i32, k: i32, alpha: *const f32, w: *const f32, b: *const f32, out: *mut f32, st: Stream) -> i32 {
+    launch(st, move || {
+        let (n, c, k) = (n as usize, c as usize, k as usize);
+        for t in 0..n {
+            let mut acc = 0.0f32;
+            for j in 0..k {
+                for cc in 0..c {
+                    acc += *w.add(j * c + cc) * snake(*x.offset((t as isize - (k - 1 - j) as isize) * c as isize + cc as isize), *alpha.add(cc));
+                }
+            }
+            *out.add(t) = (acc + *b.add(0)).tanh();
+        }
+    })
 }
 
 
