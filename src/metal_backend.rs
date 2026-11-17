@@ -152,6 +152,13 @@ struct Capture {
     ops: Vec<Op>,
 }
 
+struct F32Cache { map: std::collections::HashMap<(usize, usize, usize), MBuf>, bytes: usize }
+static F32CACHE: std::sync::OnceLock<Mutex<F32Cache>> = std::sync::OnceLock::new();
+const F32CACHE_CAP: usize = 512 << 20;
+fn f32cache() -> &'static Mutex<F32Cache> {
+    F32CACHE.get_or_init(|| Mutex::new(F32Cache { map: std::collections::HashMap::new(), bytes: 0 }))
+}
+
 std::thread_local! {
     static CAPTURE: std::cell::RefCell<Option<Capture>> = const { std::cell::RefCell::new(None) };
     // H1: pending (queue, command buffer, encoder) triples. dispatches encode
@@ -1285,6 +1292,9 @@ pub unsafe fn dr_gemm(_h: *mut c_void, a: *const Half, w: *const Half, c: *mut f
     let (m, n, k) = (m as usize, n as usize, k as usize);
     // bf16 inputs -> f32 scratch (bandwidth-bound, threaded), then one AMX SGEMM.
     // C[m, n] = A[m, k] . W[n, k]^T + beta * C (row-major).
+    // H1: CPU reads GPU-produced A/W/C here — drain the pending batch first.
+    // (Without this, dequant/gdn/etc. queued just before are silently skipped.)
+    flush_gpu();
     let (abuf, _) = scratch_f32(m * k);
     let (wbuf, _) = scratch_f32_w(n * k);
     let (a, w, c) = (SendPtr(a as *mut Half), SendPtr(w as *mut Half), SendPtr(c));
@@ -1326,6 +1336,7 @@ pub unsafe fn dr_gemm_f16(_h: *mut c_void, a: *const Half, w: *const Half, c: *m
         return 0;
     }
     let (m, n, k) = (m as usize, n as usize, k as usize);
+    flush_gpu();
     let (abuf, _) = scratch_f32(m * k);
     let (wbuf, _) = scratch_f32_w(n * k);
     let (a, w, c) = (SendPtr(a as *mut Half), SendPtr(w as *mut Half), SendPtr(c));
@@ -1335,11 +1346,36 @@ pub unsafe fn dr_gemm_f16(_h: *mut c_void, a: *const Half, w: *const Half, c: *m
             unsafe { af.write(i, f16_to_f32(a.read(i))) };
         }
     });
-    par_for!(n * k, |lo, hi| {
-        for i in lo..hi {
-            unsafe { wf.write(i, f16_to_f32(w.read(i))) };
+    // Codec weights are immutable: cache their f32 image keyed by (ptr, n, k)
+    // so repeated chunks skip the bandwidth-bound convert. Bounded (512 MB);
+    // bypass when full. (Backbone dr_gemm is NOT cached: its W is volatile
+    // dequant scratch, and its f32 image would cost GBs.)
+    let wf: SendPtr<f32> = {
+        let key = (w.ptr() as usize, n, k);
+        let hit = f32cache().lock().unwrap().map.get(&key).cloned();
+        if let Some(b) = hit {
+            SendPtr(b.0.contents() as *mut f32)
+        } else {
+            par_for!(n * k, |lo, hi| {
+                for i in lo..hi {
+                    unsafe { wf.write(i, f16_to_f32(w.read(i))) };
+                }
+            });
+            let mut fc = f32cache().lock().unwrap();
+            if fc.bytes + n * k * 4 <= F32CACHE_CAP {
+                let need = (n * k * 4) as u64;
+                let nb = ctx().device.0.new_buffer(need, metal::MTLResourceOptions::StorageModeShared);
+                track(&nb);
+                let cb = MBuf(nb);
+                unsafe { std::ptr::copy_nonoverlapping(wf.ptr() as *const u8, cb.0.contents() as *mut u8, n * k * 4) };
+                fc.bytes += n * k * 4;
+                fc.map.insert(key, cb.clone());
+                SendPtr(cb.0.contents() as *mut f32)
+            } else {
+                wf
+            }
         }
-    });
+    };
     unsafe {
         cblas_sgemm(
                 CBLAS_ROW_MAJOR,
@@ -2040,6 +2076,20 @@ pub unsafe fn dr_attn_decode(q: *const f32, kc: *const Half, vc: *const Half, ga
     if hd != 256 {
         return 1;
     }
+    // Bisect hatch: DRAMA_CPU_ATTN=1 restores the pre-H4 CPU path.
+    if std::env::var("DRAMA_CPU_ATTN").is_ok() {
+        return launch(st, move || {
+            flush_gpu();
+            let (h, hkv, hd) = (h as usize, hkv as usize, hd as usize);
+            let pos0 = (*pos_base.add(0) + pos_off) as usize;
+            let max_keys = pos0 + 1;
+            let kcv = std::slice::from_raw_parts(kc, max_keys * hkv * hd);
+            let vcv = std::slice::from_raw_parts(vc, max_keys * hkv * hd);
+            let qv = f32s(q, h * hd);
+            let gv = f32s(gate, h * hd);
+            attn_rows(qv, kcv, vcv, gv, h * hd, 1, h, hkv, hd, pos0, SendPtr(o));
+        });
+    }
     launch(st, move || {
         let (h, hkv, hd) = (h as usize, hkv as usize, hd as usize);
         let pos0 = (*pos_base.add(0) + pos_off) as usize;
@@ -2098,9 +2148,90 @@ fn softplus(x: f32) -> f32 {
 
 /// CPU: gated DeltaNet recurrence with gated RMSNorm output. dk == dv == 128 only.
 #[allow(clippy::too_many_arguments)]
+unsafe fn dr_gdn_cpu(conv: *const f32, proj: *const f32, ps: i32, z_off: i32, b_off: i32, a_off: i32, a_log: *const f32, dt_bias: *const f32, norm_w: *const f32, state: *mut f32, o: *mut f32, n: i32, nk: i32, nv: i32, dk: i32, dv: i32, eps: f32, st: Stream) -> i32 {
+    if dk != 128 || dv != 128 {
+        return 1;
+    }
+    launch(st, move || {
+        flush_gpu();
+        const DK: usize = 128;
+        let (n, nk, nv) = (n as usize, nk as usize, nv as usize);
+        let (ps, z_off, b_off, a_off) = (ps as usize, z_off as usize, b_off as usize, a_off as usize);
+        let cs = 2 * nk * DK + nv * DK;
+        let qscale = (DK as f32).sqrt().recip();
+        let (conv, proj, a_log, dt_bias, norm_w, state, o) =
+            (SendPtr(conv as *mut f32), SendPtr(proj as *mut f32), SendPtr(a_log as *mut f32), SendPtr(dt_bias as *mut f32), SendPtr(norm_w as *mut f32), SendPtr(state), SendPtr(o));
+        par_for!(nv, |lo, hi| {
+            for hh in lo..hi {
+            let kh = hh / (nv / nk);
+            let mut s = vec![0.0f32; DK * DK];
+            for k in 0..DK {
+                for v in 0..DK {
+                    s[k * DK + v] = unsafe { state.read(hh * DK * DK + k * DK + v) };
+                }
+            }
+            let a = -unsafe { a_log.read(hh) }.exp();
+            let dtb = unsafe { dt_bias.read(hh) };
+            let convp = conv.ptr() as *const f32;
+            let projp = proj.ptr() as *const f32;
+            for t in 0..n {
+                let cr = f32s(convp, (t + 1) * cs);
+                let cr = &cr[t * cs..];
+                let pr = f32s(projp, (t + 1) * ps);
+                let pr = &pr[t * ps..];
+                // q/k normalisation WITHOUT the head-dim average (matches k_gdn:
+                // rsqrt(sum) * qscale, not an RMSNorm).
+                let qv: Vec<f32> = (0..DK).map(|i| cr[kh * DK + i]).collect();
+                let kv: Vec<f32> = (0..DK).map(|i| cr[nk * DK + kh * DK + i]).collect();
+                let qi = qscale / (qv.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt();
+                let ki = 1.0 / (kv.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt();
+                let mut qs = vec![0.0f32; DK];
+                let mut ks = vec![0.0f32; DK];
+                for i in 0..DK {
+                    qs[i] = qv[i] * qi;
+                    ks[i] = kv[i] * ki;
+                }
+                let vv: Vec<f32> = (0..DK).map(|v| cr[2 * nk * DK + hh * DK + v]).collect();
+                let decay = (a * softplus(pr[a_off + hh] + dtb)).exp();
+                let beta = sigmoid(pr[b_off + hh]);
+                let mut outv = vec![0.0f32; DK];
+                for v in 0..DK {
+                    let mut kvm = 0.0f32;
+                    for k in 0..DK {
+                        s[k * DK + v] *= decay;
+                        kvm += s[k * DK + v] * ks[k];
+                    }
+                    let delta = (vv[v] - kvm) * beta;
+                    let mut oacc = 0.0f32;
+                    for k in 0..DK {
+                        s[k * DK + v] += ks[k] * delta;
+                        oacc += s[k * DK + v] * qs[k];
+                    }
+                    outv[v] = oacc;
+                }
+                let zr: Vec<f32> = (0..DK).map(|v| pr[z_off + hh * DK + v]).collect();
+                let inv = rms_inv(&outv, eps);
+                for v in 0..DK {
+                    unsafe { o.write(t * nv * DK + hh * DK + v, outv[v] * inv * norm_w.read(v) * silu(zr[v])); }
+                }
+            }
+            for k in 0..DK {
+                for v in 0..DK {
+                    unsafe { state.write(hh * DK * DK + k * DK + v, s[k * DK + v]); }
+                }
+            }
+            }
+        });
+    })
+}
+
 pub unsafe fn dr_gdn(conv: *const f32, proj: *const f32, ps: i32, z_off: i32, b_off: i32, a_off: i32, a_log: *const f32, dt_bias: *const f32, norm_w: *const f32, state: *mut f32, o: *mut f32, n: i32, nk: i32, nv: i32, dk: i32, dv: i32, eps: f32, st: Stream) -> i32 {
     if dk != 128 || dv != 128 {
         return 1;
+    }
+    // Bisect hatch: DRAMA_CPU_GDN=1 restores the pre-H5 CPU path.
+    if std::env::var("DRAMA_CPU_GDN").is_ok() {
+        return unsafe { dr_gdn_cpu(conv, proj, ps, z_off, b_off, a_off, a_log, dt_bias, norm_w, state, o, n, nk, nv, dk, dv, eps, st) };
     }
     launch(st, move || {
         let prm = GdnP {
