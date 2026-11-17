@@ -19,6 +19,13 @@ name = "drama"
 default = ["cli"]
 # the `drama` command-line binary (clap). Disable default features to use drama as a library
 cli = ["dep:clap"]
+# NVIDIA CUDA backend: compiles kernels/*.cu with nvcc and links cudart/cublas.
+# Required for actual inference; off by default so the crate also builds where there
+# is no CUDA toolkit (e.g. Apple Silicon, the target of the MLX port in docs/MLX-PORT.md).
+cuda = []
+# Apple-Silicon backend: Metal device memory, command queues and hand-written MSL
+# kernels + CPU reference implementations (see docs/MLX-PORT.md). Mutually exclusive
+# with `cuda`.
 
 [[bin]]
 name = "drama"
