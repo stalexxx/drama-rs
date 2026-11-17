@@ -1475,11 +1475,13 @@ fn f32_to_f16_rn(v: f32) -> u16 {
     let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
     let m = b & 0x7fffff;
     if e <= 0 {
+        // Subnormal f16 (or underflow to zero): value is 1.M * 2^E with E <= -15,
+        // i.e. (0x800000|m) >> (14 - e) in units of 2^-24, rounded to nearest even.
         if e < -10 {
             return s as u16;
         }
         let m = m | 0x800000;
-        let shift = (1 - e) as u32;
+        let shift = (14 - e) as u32;
         let mut out = m >> shift;
         let rest = m & ((1 << shift) - 1);
         let half = 1 << (shift - 1);
