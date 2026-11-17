@@ -22,7 +22,9 @@ fn main() {
     // provides stub functions with identical signatures that report the missing
     // backend at runtime, so the crate still builds and links (e.g. on macOS).
     if std::env::var("CARGO_FEATURE_CUDA").is_err() {
-        println!("cargo:warning=drama-rs: building without the `cuda` feature; inference will fail at runtime");
+        if std::env::var("CARGO_FEATURE_METAL").is_err() {
+            println!("cargo:warning=drama-rs: building without the `cuda` or `metal` features; inference will fail at runtime");
+        }
         return;
     }
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());

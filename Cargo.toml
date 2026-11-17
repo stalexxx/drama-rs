@@ -26,6 +26,7 @@ cuda = []
 # Apple-Silicon backend: Metal device memory, command queues and hand-written MSL
 # kernels + CPU reference implementations (see docs/MLX-PORT.md). Mutually exclusive
 # with `cuda`.
+metal = ["dep:metal"]
 
 [[bin]]
 name = "drama"
@@ -38,6 +39,7 @@ clap = { version = "4", features = ["derive"], optional = true }
 half = "2"
 hound = "3.5"
 memmap2 = "0.9"
+metal = { version = "0.33", optional = true }
 safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
