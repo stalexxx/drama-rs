@@ -645,9 +645,6 @@ pub unsafe fn dr_conv_out(_x: *const f32, _n: i32, _c: i32, _k: i32, _alpha: *co
     unported()
 }
 
-pub unsafe fn dr_dequant_q8(w: *const i8, s: *const Half, out: *mut Half, n: i32, k: i32, st: Stream) -> i32 {
-    unported()
-}
 
 pub unsafe fn dr_dwconv(_x: *const f32, _t: i32, _c: i32, _k: i32, _w: *const f32, _b: *const f32, _out: *mut f32, _st: Stream) -> i32 {
     unported()
@@ -661,9 +658,6 @@ pub unsafe fn dr_epilogue(_y: *const f32, _n: usize, _c: i32, _bias: *const f32,
     unported()
 }
 
-pub unsafe fn dr_f32_to_bf16(x: *const f32, y: *mut Half, n: usize, st: Stream) -> i32 {
-    unported()
-}
 
 pub unsafe fn dr_frame_end(next: *const i32, in_frame: *mut i32, ras: *mut i32, ras_len: i32, pos: *mut i32, step: *mut u64, hist: *mut i32, hist_len: *mut i32, hist_cap: i32, width: i32, st: Stream) -> i32 {
     unported()
@@ -673,9 +667,6 @@ pub unsafe fn dr_gdn(conv: *const f32, proj: *const f32, ps: i32, z_off: i32, b_
     unported()
 }
 
-pub unsafe fn dr_gemv_bf16(w: *const Half, x: *const f32, y: *mut f32, n: i32, k: i32, nw: *const f32, eps: f32, _pf: *const c_char, _pfb: usize, st: Stream) -> i32 {
-    unported()
-}
 
 pub unsafe fn dr_gemv_q8(w: *const i8, s: *const Half, x: *const f32, res: *const f32, y: *mut f32, n: i32, k: i32, nw: *const f32, eps: f32, _pf: *const c_char, _pfb: usize, st: Stream) -> i32 {
     unported()
@@ -721,9 +712,6 @@ pub unsafe fn dr_qk_norm_rope(qkv: *const f32, rs: i32, rows: i32, h: i32, hkv: 
     unported()
 }
 
-pub unsafe fn dr_rmsnorm(x: *const f32, w: *const f32, y: *mut f32, yb: *mut Half, rows: i32, d: i32, eps: f32, st: Stream) -> i32 {
-    unported()
-}
 
 pub unsafe fn dr_rmsnorm_plain(_x: *const f32, _rows: i32, _c: i32, _w: *const f32, _eps: f32, _out: *mut f32, _o16: *mut Half, _st: Stream) -> i32 {
     unported()
@@ -749,9 +737,6 @@ pub unsafe fn dr_swiglu16(_h: *const f32, _y: *mut Half, _rows: i32, _i: i32, _s
     unported()
 }
 
-pub unsafe fn dr_swiglu_rows(h: *const f32, y: *mut Half, rows: i32, i: i32, st: Stream) -> i32 {
-    unported()
-}
 
 pub unsafe fn dr_tconv_gather(_x: *const f32, _n: i32, _c: i32, _two: i32, _alpha: *const f32, _out: *mut Half, _st: Stream) -> i32 {
     unported()
@@ -764,3 +749,93 @@ pub unsafe fn dr_tower_in(h: *const f32, frames: *const i32, fstride: i32, code_
 pub unsafe fn dr_vq_encode(_r: *mut f32, _rows: i32, _d: i32, _in_w: *const f32, _in_b: *const f32, _cbn: *const f32, _n: i32, _table: *const f32, _codes: *mut i32, _cs: i32, _st: Stream) -> i32 {
     unported()
 }
+// ---------------------------------------------------------------------------
+// MSL-backed ops
+
+/// MSL: rmsnorm.
+///
+/// y[r] = x[r] * inv * w (f32 and/or bf16). `w` is required by every caller.
+pub unsafe fn dr_rmsnorm(x: *const f32, w: *const f32, y: *mut f32, yb: *mut Half, rows: i32, d: i32, eps: f32, st: Stream) -> i32 {
+    launch(st, move || {
+        let xb = require(x as *const c_void);
+        let wb = require(w as *const c_void);
+        let prm = NormP { rows: rows as u32, d: d as u32, eps };
+        dispatch(
+            "rmsnorm",
+            &[Some(xb), Some(wb), opt_buf(y as *const c_void, 0), opt_buf(yb as *const c_void, 0)],
+            pb(&prm),
+            (rows as u64, 1, 1),
+            (256, 1, 1),
+            true,
+        );
+    })
+}
+
+/// MSL: y[n] = W[n] . norm(x) (+ fused RMSNorm when `nw` is set).
+pub unsafe fn dr_gemv_bf16(w: *const Half, x: *const f32, y: *mut f32, n: i32, k: i32, nw: *const f32, eps: f32, _pf: *const c_char, _pfb: usize, st: Stream) -> i32 {
+    launch(st, move || {
+        let wb = require(w as *const c_void);
+        let yb = require(y as *const c_void);
+        let xv: (MBuf, u64) = if nw.is_null() {
+            require(x as *const c_void)
+        } else {
+            let (sb, soff) = scratch_f32(k as usize);
+            let nwb = require(nw as *const c_void);
+            let xb = require(x as *const c_void);
+            let prm = NormP { rows: 1, d: k as u32, eps };
+            dispatch("rmsnorm", &[Some(xb), Some(nwb), Some((sb.clone(), soff)), None], pb(&prm), (1, 1, 1), (256, 1, 1), true);
+            (sb, soff)
+        };
+        let prm = GemvP { n: n as u32, k: k as u32 };
+        dispatch("gemv_bf16", &[Some(wb), Some(xv), Some(yb)], pb(&prm), (n as u64, 1, 1), (256, 1, 1), true);
+    })
+}
+
+/// MSL: dequantise int8 group-128 weights to bf16.
+pub unsafe fn dr_dequant_q8(w: *const i8, s: *const Half, out: *mut Half, n: i32, k: i32, st: Stream) -> i32 {
+    launch(st, move || {
+        let prm = DqP { n: n as u32, k: k as u32 };
+        let total = n as u64 * k as u64;
+        dispatch(
+            "dequant_q8",
+            &[opt_buf(w as *const c_void, 0), opt_buf(s as *const c_void, 0), opt_buf(out as *const c_void, 0)],
+            pb(&prm),
+            (ceil256(total), 1, 1),
+            (256, 1, 1),
+            false,
+        );
+    })
+}
+
+/// MSL: f32 -> bf16 (round-to-nearest-even).
+pub unsafe fn dr_f32_to_bf16(x: *const f32, y: *mut Half, n: usize, st: Stream) -> i32 {
+    launch(st, move || {
+        let nu = n as u32;
+        dispatch(
+            "f32_to_bf16",
+            &[opt_buf(x as *const c_void, 0), opt_buf(y as *const c_void, 0)],
+            pb(&nu),
+            (ceil256(n as u64), 1, 1),
+            (256, 1, 1),
+            false,
+        );
+    })
+}
+
+/// MSL: y[r, j] = silu(h[r, j]) * h[r, I + j] in bf16.
+pub unsafe fn dr_swiglu_rows(h: *const f32, y: *mut Half, rows: i32, i: i32, st: Stream) -> i32 {
+    launch(st, move || {
+        let dims = [rows as u32, i as u32];
+        let total = rows as u64 * i as u64;
+        dispatch(
+            "swiglu_rows",
+            &[opt_buf(h as *const c_void, 0), opt_buf(y as *const c_void, 0)],
+            pb(&dims),
+            (ceil256(total), 1, 1),
+            (256, 1, 1),
+            false,
+        );
+    })
+}
+
+// ---------------------------------------------------------------------------
