@@ -927,13 +927,21 @@ fn pending_enc(q: usize) -> bool {
 
 /// End, commit and wait for every pending command buffer (all queues).
 /// Call before any CPU read of GPU-produced data and at graph end.
+/// End, commit and wait for every pending command buffer (all queues).
+/// Call before any CPU read of GPU-produced data and at graph end.
+/// Panics with the Metal error on command-buffer failure: silent GPU errors
+/// used to poison downstream CPU reads (NaN -> topk panic far away).
 fn flush_gpu() {
+    use metal::MTLCommandBufferStatus;
     PENDING.with(|p| {
         let mut p = p.borrow_mut();
         for (_, cb, enc, _) in p.drain(..) {
             enc.end_encoding();
             cb.commit();
             cb.wait_until_completed();
+            if cb.status() == MTLCommandBufferStatus::Error {
+                panic!("metal: command buffer failed (status=Error)");
+            }
         }
     });
 }
@@ -997,6 +1005,11 @@ fn scratch_here(slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<M
         let need = (n_elems.max(1) as u64) * 4;
         let ok = s.as_ref().map(|b| b.0.length() >= need).unwrap_or(false);
         if !ok {
+            // Unregister the replaced buffer: pending command buffers hold their
+            // own refs via set_buffer, so removal is safe and stops BUFS growth.
+            if let Some(old) = s.take() {
+                BUFS.lock().unwrap().remove(&(old.0.contents() as usize));
+            }
             let b = ctx().device.0.new_buffer(need, metal::MTLResourceOptions::StorageModeShared);
             track(&b);
             *s = Some(MBuf(b));
@@ -1118,8 +1131,33 @@ pub unsafe fn dr_malloc(p: *mut *mut c_void, n: usize) -> i32 {
 }
 
 pub unsafe fn dr_free(p: *mut c_void) -> i32 {
-    if !p.is_null() {
-        BUFS.lock().unwrap().remove(&(p as usize));
+    if p.is_null() {
+        return 0;
+    }
+    BUFS.lock().unwrap().remove(&(p as usize));
+    // Drop f32-cache entries keyed by the freed buffer: the allocator may
+    // hand the same address to different weights of the same shape, and a
+    // stale entry would feed GEMM the old matrix. Also unregister the cached
+    // twin buffers so BUFS never points at dropped memory.
+    // (Scoped locks: never hold F32CACHE and BUFS at once — gemm takes them
+    // in the opposite order.)
+    let twins: Vec<usize> = {
+        let mut fc = f32cache().lock().unwrap();
+        let stale: Vec<_> = fc.map.iter().filter(|(k, _)| k.0 == p as usize).map(|(k, b)| (*k, b.0.contents() as usize)).collect();
+        let mut twins = Vec::with_capacity(stale.len());
+        for (k, twin) in stale {
+            if let Some(b) = fc.map.remove(&k) {
+                fc.bytes -= (b.0.length() as usize).min(fc.bytes);
+            }
+            twins.push(twin);
+        }
+        twins
+    };
+    if !twins.is_empty() {
+        let mut bufs = BUFS.lock().unwrap();
+        for t in twins {
+            bufs.remove(&t);
+        }
     }
     0
 }
@@ -2293,36 +2331,12 @@ fn gelu_erf(v: f32) -> f32 {
     0.5 * v * (1.0 + erf_approx(v * 0.70710678118654752))
 }
 
-/// Round-to-nearest-even f32 -> f16 bits (matches `__float2half`).
-fn f32_to_f16_rn(v: f32) -> u16 {
-    let b = v.to_bits();
-    let s = (b >> 16) & 0x8000;
-    let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
-    let m = b & 0x7fffff;
-    if e <= 0 {
-        // Subnormal f16 (or underflow to zero): value is 1.M * 2^E with E <= -15,
-        // i.e. (0x800000|m) >> (14 - e) in units of 2^-24, rounded to nearest even.
-        if e < -10 {
-            return s as u16;
-        }
-        let m = m | 0x800000;
-        let shift = (14 - e) as u32;
-        let mut out = m >> shift;
-        let rest = m & ((1 << shift) - 1);
-        let half = 1 << (shift - 1);
-        if rest > half || (rest == half && (out & 1) == 1) {
-            out += 1;
-        }
-        return (s | out) as u16;
-    }
-    if e >= 31 {
-        return if m == 0 { (s | 0x7c00) as u16 } else { (s | 0x7e00) as u16 };
-    }
-    let m = m + 0xfff + ((m >> 13) & 1);
-    if m >= 0x800000 {
-        return (s | ((e as u32 + 1) << 10)) as u16;
-    }
-    (s | ((e as u32) << 10) | (m >> 13)) as u16
+/// Round-to-nearest-even f32 -> f16 bits (matches `__float2half`:
+/// finite overflow -> +inf, never NaN). Delegated to the `half` crate
+/// (the hand-rolled version misclassified finite 70000.0 as NaN).
+/// Round-to-nearest-even f32 -> f16 bits; also used by tests.
+pub fn f32_to_f16_rn(v: f32) -> u16 {
+    half::f16::from_f32(v).to_bits()
 }
 
 /// CPU: out[t] = sum_c table[row(c, codes[t, c])].

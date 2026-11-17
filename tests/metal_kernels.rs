@@ -800,3 +800,21 @@ fn gdn_matches_cpu() {
         assert!((stt[i] - stt_want(i)).abs() < 0.05 * stt_want(i).abs().max(1.0), "state[{i}]: {} vs {}", stt[i], stt_want(i));
     }
 }
+
+#[test]
+fn f32_to_f16_edge_cases() {
+    // 65504 = f16 max, 65520 rounds up to inf, 70000.0 must be inf (not NaN).
+    for (v, want) in [
+        (65504.0f32, 0x7bffu16),
+        (65520.0f32, 0x7c00u16),
+        (70000.0f32, 0x7c00u16),
+        (-70000.0f32, 0xfc00u16),
+        (f32::INFINITY, 0x7c00u16),
+        (f32::NEG_INFINITY, 0xfc00u16),
+        (0.0f32, 0x0000u16),
+        (1.0f32, 0x3c00u16),
+    ] {
+        assert_eq!(ffi::f32_to_f16_rn(v), want, "value {v}");
+    }
+    assert!(half::f16::from_bits(ffi::f32_to_f16_rn(f32::NAN)).is_nan());
+}
