@@ -644,3 +644,159 @@ fn sgemm_determinism() {
         }
     }
 }
+
+#[test]
+fn attn_decode_matches_cpu() {
+    let s = st();
+    const H: usize = 2;
+    const HKV: usize = 1;
+    const HD: usize = 256;
+    const NK: usize = 17;
+    let mut rng = Rng(0xa77e);
+    let q: Vec<f32> = (0..H * HD).map(|_| rng.f32()).collect();
+    let kc: Vec<u16> = (0..NK * HKV * HD).map(|_| bf16_test(rng.f32())).collect();
+    let vc: Vec<u16> = (0..NK * HKV * HD).map(|_| bf16_test(rng.f32())).collect();
+    let gate: Vec<f32> = (0..H * HD).map(|_| rng.f32()).collect();
+    let pos = vec![(NK - 1) as i32];
+    let up = |d: &[u8]| alloc(d.len(), s, Some(d));
+    let qp = up(&bytes_of(&q));
+    let kcp = up(&bytes_of(&kc));
+    let vcp = up(&bytes_of(&vc));
+    let gp = up(&bytes_of(&gate));
+    let pp = up(&bytes_of(&pos));
+    let op = up(&vec![0u8; H * HD * 4]);
+    let partp = up(&vec![0u8; 64]);
+    assert_eq!(
+        unsafe {
+            ffi::dr_attn_decode(
+                qp as *const f32, kcp as *const u16, vcp as *const u16, gp as *const f32,
+                H as i32, HKV as i32, HD as i32, pp as *const i32, 0, partp as *mut f32, op as *mut f32, s,
+            )
+        },
+        0
+    );
+    let o: Vec<f32> = down(op, H * HD, s);
+    // CPU oracle (mirrors attn_rows, decode row).
+    let scale = (HD as f32).sqrt().recip();
+    let bf = |h: u16| bf16_test_f32(h);
+    let mut want = vec![0.0f32; H * HD];
+    for hh in 0..H {
+        let kh = hh / (H / HKV);
+        let mut m = f32::NEG_INFINITY;
+        let mut l = 0.0f32;
+        let mut acc = vec![0.0f32; HD];
+        for j in 0..NK {
+            let mut sc = 0.0f32;
+            for d in 0..HD {
+                sc += q[hh * HD + d] * bf(kc[(j * HKV + kh) * HD + d]);
+            }
+            sc *= scale;
+            let mn = m.max(sc);
+            let corr = (m - mn).exp();
+            let p = (sc - mn).exp();
+            l = l * corr + p;
+            for d in 0..HD {
+                acc[d] = acc[d] * corr + p * bf(vc[(j * HKV + kh) * HD + d]);
+            }
+            m = mn;
+        }
+        for d in 0..HD {
+            let gv = gate[hh * HD + d];
+            want[hh * HD + d] = acc[d] / l * (1.0 / (1.0 + (-gv).exp()));
+        }
+    }
+    for i in 0..H * HD {
+        assert!((o[i] - want[i]).abs() < 0.03 * want[i].abs().max(1.0), "out[{i}]: {} vs {}", o[i], want[i]);
+    }
+}
+
+fn silu_cpu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+#[test]
+fn gdn_matches_cpu() {
+    let s = st();
+    const DK: usize = 128;
+    let nv: usize = std::env::var("GDN_NV").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+    let nk: usize = if nv == 32 { 16 } else { 2 };
+    let nn: usize = std::env::var("GDN_N").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let cs = 2 * nk * DK + nv * DK;
+    let ps = nv * DK + 512;
+    let (z_off, b_off, a_off) = (0usize, nv * DK, nv * DK + 64);
+    let mut rng = Rng(0x6d6e);
+    let conv: Vec<f32> = (0..nn * cs).map(|_| rng.f32() * 0.5).collect();
+    let proj: Vec<f32> = (0..nn * ps).map(|_| rng.f32() * 0.5).collect();
+    let alog: Vec<f32> = (0..nv).map(|_| rng.f32().abs() * 2.0).collect(); // realistic: decay << 1
+    let dtb: Vec<f32> = (0..nv).map(|_| rng.f32() * 0.2).collect();
+    let nw: Vec<f32> = (0..DK).map(|_| 0.8 + rng.f32().abs() * 0.4).collect();
+    let state: Vec<f32> = (0..nv * DK * DK).map(|_| rng.f32() * 0.1).collect();
+    let up = |d: &[u8]| alloc(d.len(), s, Some(d));
+    let cvp = up(&bytes_of(&conv));
+    let prp = up(&bytes_of(&proj));
+    let alp = up(&bytes_of(&alog));
+    let dtp = up(&bytes_of(&dtb));
+    let nwp = up(&bytes_of(&nw));
+    let stp = up(&bytes_of(&state));
+    let op = up(&vec![0u8; nn * nv * DK * 4]);
+    assert_eq!(
+        unsafe {
+            ffi::dr_gdn(
+                cvp as *const f32, prp as *const f32, ps as i32, z_off as i32, b_off as i32, a_off as i32,
+                alp as *const f32, dtp as *const f32, nwp as *const f32, stp as *mut f32, op as *mut f32,
+                nn as i32, nk as i32, nv as i32, DK as i32, DK as i32, 1e-5, s,
+            )
+        },
+        0
+    );
+    let o: Vec<f32> = down(op, nn * nv * DK, s);
+    // CPU oracle (mirrors the old dr_gdn math).
+    let qscale = (DK as f32).sqrt().recip();
+    let mut stt_oracle = state.clone();
+    let mut want = vec![0.0f32; nn * nv * DK];
+    for hh in 0..nv {
+        let kh = hh / (nv / nk);
+        let a = -alog[hh].exp(); // A = -exp(A_log), decay = exp(A * softplus(.)) < 1
+        for tt in 0..nn {
+            let cr = &conv[tt * cs..(tt + 1) * cs];
+            let pr = &proj[tt * ps..(tt + 1) * ps];
+            let qv: Vec<f32> = (0..DK).map(|i| cr[kh * DK + i]).collect();
+            let kv: Vec<f32> = (0..DK).map(|i| cr[nk * DK + kh * DK + i]).collect();
+            let qi = qscale / (qv.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt();
+            let ki = 1.0 / (kv.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt();
+            let qs: Vec<f32> = qv.iter().map(|x| x * qi).collect();
+            let ks: Vec<f32> = kv.iter().map(|x| x * ki).collect();
+            let vv: Vec<f32> = (0..DK).map(|v| cr[2 * nk * DK + hh * DK + v]).collect();
+            let decay = (a * (pr[a_off + hh] + dtb[hh]).exp().ln_1p()).exp();
+            let beta = 1.0 / (1.0 + (-pr[b_off + hh]).exp());
+            let mut outv = vec![0.0f32; DK];
+            for v in 0..DK {
+                let mut kvm = 0.0f32;
+                for k in 0..DK {
+                    stt_oracle[hh * DK * DK + k * DK + v] *= decay;
+                    kvm += stt_oracle[hh * DK * DK + k * DK + v] * ks[k];
+                }
+                let delta = (vv[v] - kvm) * beta;
+                let mut oacc = 0.0f32;
+                for k in 0..DK {
+                    stt_oracle[hh * DK * DK + k * DK + v] += ks[k] * delta;
+                    oacc += stt_oracle[hh * DK * DK + k * DK + v] * qs[k];
+                }
+                outv[v] = oacc;
+            }
+            let inv = 1.0 / ((outv.iter().map(|x| x * x).sum::<f32>() / DK as f32 + 1e-5).sqrt());
+            for v in 0..DK {
+                let zr = pr[z_off + hh * DK + v];
+                want[tt * nv * DK + hh * DK + v] = outv[v] * inv * nw[v] * silu_cpu(zr);
+            }
+        }
+    }
+    for i in 0..nn * nv * DK {
+        assert!((o[i] - want[i]).abs() < 0.05 * want[i].abs().max(1.0), "out[{i}]: {} vs {}", o[i], want[i]);
+    }
+    let stt: Vec<f32> = down(stp, nv * DK * DK, s);
+    let stt_want = |i: usize| stt_oracle[i];
+    for i in 0..nv * DK * DK {
+        assert!((stt[i] - stt_want(i)).abs() < 0.05 * stt_want(i).abs().max(1.0), "state[{i}]: {} vs {}", stt[i], stt_want(i));
+    }
+}

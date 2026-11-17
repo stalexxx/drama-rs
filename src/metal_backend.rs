@@ -227,22 +227,93 @@ impl<T: Copy> SendPtr<T> {
 /// site, so the worker closure only needs `Send` (raw device pointers qualify);
 /// all other captures must be `Copy` as each thread gets its own copy.
 /// Callers must ensure ranges write disjoint memory.
+/// Persistent worker pool (H2): `par_for!` used to spawn N OS threads per
+/// op (profiled as a top hotspot); workers now persist and take jobs from a
+/// queue. Jobs are `FnOnce + Send`; the main thread blocks until its batch
+/// completes. Re-entrant calls from workers run serially (TLS guard).
+type Job = Box<dyn FnOnce() + Send + 'static>;
+struct Pool {
+    tx: std::sync::mpsc::Sender<Job>,
+    pending: std::sync::Mutex<usize>,
+    done: std::sync::Condvar,
+    threads: usize,
+}
+std::thread_local! {
+    static IN_POOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+static POOL: std::sync::OnceLock<Pool> = std::sync::OnceLock::new();
+fn pool() -> &'static Pool {
+    POOL.get_or_init(|| {
+        let threads = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4);
+        let (tx, rx) = std::sync::mpsc::channel::<Job>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        for _ in 0..threads {
+            let rx = rx.clone();
+            std::thread::spawn(move || {
+                IN_POOL.with(|f| f.set(true));
+                loop {
+                    let job = rx.lock().unwrap().recv().unwrap();
+                    job();
+                }
+            });
+        }
+        Pool { tx, pending: std::sync::Mutex::new(0), done: std::sync::Condvar::new(), threads }
+    })
+}
+fn pool_run<F: FnOnce() + Send>(f: F) {
+    let p = pool();
+    *p.pending.lock().unwrap() += 1;
+    // SAFETY: lifetime-erased like std::thread::scope — the caller always
+    // joins via pool_wait() (enforced by WaitGuard on panic paths) before its
+    // stack frame can exit, so borrowed captures stay alive.
+    let f: Job = unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send>, Job>(Box::new(f)) };
+    p.tx.send(f).unwrap();
+}
+/// Joins pending pool jobs on drop (panic safety for par_for!).
+struct WaitGuard(bool);
+impl Drop for WaitGuard {
+    fn drop(&mut self) {
+        if !self.0 {
+            pool_wait();
+        }
+    }
+}
+fn pool_wait() {
+    let p = pool();
+    let mut g = p.pending.lock().unwrap();
+    while *g > 0 {
+        g = p.done.wait(g).unwrap();
+    }
+}
+fn pool_job_done() {
+    let p = pool();
+    let mut g = p.pending.lock().unwrap();
+    *g -= 1;
+    if *g == 0 {
+        p.done.notify_all();
+    }
+}
 macro_rules! par_for {
     ($n:expr, |$lo:ident, $hi:ident| $body:block) => {{
         let n__ = $n;
         if n__ > 0 {
+            let reenter__ = IN_POOL.with(|f| f.get());
             let threads__ = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).min(n__).max(1);
-            if threads__ <= 1 {
+            if threads__ <= 1 || reenter__ {
                 let ($lo, $hi) = (0usize, n__);
                 $body
             } else {
                 let chunk__ = (n__ + threads__ - 1) / threads__;
-                std::thread::scope(|scope__| {
-                    for t__ in 0..threads__ {
-                        let ($lo, $hi) = (t__ * chunk__, ((t__ + 1) * chunk__).min(n__));
-                        scope__.spawn(move || $body);
-                    }
-                });
+                let mut guard__ = WaitGuard(false);
+                for t__ in 0..threads__ {
+                    let ($lo, $hi) = (t__ * chunk__, ((t__ + 1) * chunk__).min(n__));
+                    pool_run(move || {
+                        $body
+                        pool_job_done();
+                    });
+                }
+                pool_wait();
+                guard__.0 = true;
             }
         }
     }};
@@ -486,6 +557,144 @@ inline ushort f32_to_bf16_msl(float v) {
     return (ushort)((b + 0x7fffu + ((b >> 16) & 1u)) >> 16);
 }
 
+
+struct AttnP { uint h; uint hkv; uint hd; uint nkeys; float scale; };
+
+struct GdnP { uint n; uint nk; uint nv; uint ps; uint z_off; uint b_off; uint a_off; float eps; };
+
+// Gated delta rule: one threadgroup per head, 128 threads (one per v).
+// Fully serial per thread over k and t; no barriers needed (disjoint columns).
+kernel void gdn(device const float* CONV [[buffer(0)]],
+           device const float* PROJ [[buffer(1)]],
+           device const float* ALOG [[buffer(2)]],
+           device const float* DTB [[buffer(3)]],
+           device const float* NW [[buffer(4)]],
+           device float* STATE [[buffer(5)]],
+           device float* OUT [[buffer(6)]],
+           constant GdnP& p [[buffer(7)]],
+           uint3 tpg [[threads_per_threadgroup]],
+           uint3 tid [[thread_position_in_threadgroup]],
+           uint3 gid [[threadgroup_position_in_grid]]) {
+    uint hh = gid.x;
+    if (hh >= p.nv) return;
+    uint v = tid.x;
+    if (v >= 128) return;
+    const uint DK = 128;
+    uint kh = hh / (p.nv / p.nk);
+    uint cs = 2 * p.nk * DK + p.nv * DK;
+    float qscale = rsqrt((float)DK);
+    float a = -exp(ALOG[hh]);
+    float dtb = DTB[hh];
+    for (uint t = 0; t < p.n; ++t) {
+        device const float* cr = CONV + t * cs;
+        device const float* pr = PROJ + t * p.ps;
+        float qsum = 0.0f, ksum = 0.0f;
+        for (uint i = 0; i < DK; ++i) {
+            float qv = cr[kh * DK + i];
+            float kv = cr[p.nk * DK + kh * DK + i];
+            qsum += qv * qv;
+            ksum += kv * kv;
+        }
+        float qi = qscale / sqrt(qsum + 1e-6f);
+        float ki = 1.0f / sqrt(ksum + 1e-6f);
+        float vv = cr[2 * p.nk * DK + hh * DK + v];
+        float gv = pr[p.a_off + hh] + dtb;
+        float decay = exp(a * (gv > 20.0f ? gv : log(1.0f + exp(gv))));
+        float beta = 1.0f / (1.0f + exp(-pr[p.b_off + hh]));
+        float kvm = 0.0f;
+        for (uint k = 0; k < DK; ++k) {
+            uint idx = hh * DK * DK + k * DK + v;
+            STATE[idx] *= decay;
+            kvm += STATE[idx] * (cr[p.nk * DK + kh * DK + k] * ki);
+        }
+        float delta = (vv - kvm) * beta;
+        float oacc = 0.0f;
+        for (uint k = 0; k < DK; ++k) {
+            uint idx = hh * DK * DK + k * DK + v;
+            float ks = cr[p.nk * DK + kh * DK + k] * ki;
+            float qs = cr[kh * DK + k] * qi;
+            STATE[idx] += ks * delta;
+            oacc += STATE[idx] * qs;
+        }
+        threadgroup float tacc[128];
+        tacc[v] = oacc * oacc;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // rms over v (parallel halves), then per-v output.
+        threadgroup float invm[1];
+        if (v < 64) tacc[v] += tacc[v + 64];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (v < 32) tacc[v] += tacc[v + 32];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // NOTE: 32-way tail reduced serially by thread 0 (short).
+        if (v == 0) {
+            float ss = tacc[0];
+            for (uint i = 1; i < 32; ++i) ss += tacc[i];
+            invm[0] = rsqrt(ss / (float)DK + p.eps);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float zr = pr[p.z_off + hh * DK + v];
+        OUT[t * p.nv * DK + hh * DK + v] = oacc * invm[0] * NW[v] * (zr / (1.0f + exp(-zr)));
+    }
+}
+
+// Single-row decode attention: one threadgroup per head. Phases: parallel
+// max-score, serial l (thread 0), parallel outputs (one d per thread).
+// Scores are recomputed per phase (no length cap) rather than staged.
+kernel void attn_decode(device const float* Q [[buffer(0)]],
+                    device const ushort* KC [[buffer(1)]],
+                    device const ushort* VC [[buffer(2)]],
+                    device const float* GATE [[buffer(3)]],
+                    device float* OUT [[buffer(4)]],
+                    constant AttnP& p [[buffer(5)]],
+                    uint3 tpg [[threads_per_threadgroup]],
+                    uint3 tid [[thread_position_in_threadgroup]],
+                    uint3 gid [[threadgroup_position_in_grid]]) {
+    uint hh = gid.x;
+    if (hh >= p.h) return;
+    uint hkv = p.hkv, hd = p.hd, nkeys = p.nkeys;
+    uint kh = hh / (p.h / hkv);
+    float lmax = -INFINITY;
+    for (uint j = tid.x; j < nkeys; j += tpg.x) {
+        float s = 0.0f;
+        for (uint d = 0; d < hd; ++d)
+            s += Q[hh * hd + d] * bf16_to_f32_msl(KC[(j * hkv + kh) * hd + d]);
+        lmax = max(lmax, s * p.scale);
+    }
+    threadgroup float part[256];
+    part[tid.x] = lmax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg.x >> 1; s > 0; s >>= 1) {
+        if (tid.x < s) part[tid.x] = max(part[tid.x], part[tid.x + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float m = part[0];
+    threadgroup float lmem[1];
+    if (tid.x == 0) {
+        float l = 0.0f;
+        for (uint j = 0; j < nkeys; ++j) {
+            float s = 0.0f;
+            for (uint d = 0; d < hd; ++d)
+                s += Q[hh * hd + d] * bf16_to_f32_msl(KC[(j * hkv + kh) * hd + d]);
+            l += exp(s * p.scale - m);
+        }
+        lmem[0] = l;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float l = lmem[0];
+    for (uint d = tid.x; d < hd; d += tpg.x) {
+        float acc = 0.0f;
+        for (uint j = 0; j < nkeys; ++j) {
+            float s = 0.0f;
+            for (uint dd = 0; dd < hd; ++dd)
+                s += Q[hh * hd + dd] * bf16_to_f32_msl(KC[(j * hkv + kh) * hd + dd]);
+            acc += exp(s * p.scale - m) * bf16_to_f32_msl(VC[(j * hkv + kh) * hd + d]);
+        }
+        float gv = GATE[hh * hd + d];
+        OUT[hh * hd + d] = acc / l * (1.0f / (1.0f + exp(-gv)));
+    }
+}
+
+
 // MoE prefill gate: one threadgroup per slot; 256 threads x 2 cols each.
 // act[s*mi+j] = bf16(silu(G_e . x) * (U_e . x)), e = slot_expert[s].
 kernel void moe_pf_gate_up(device const uchar* GQ [[buffer(0)]],
@@ -660,6 +869,27 @@ struct MoePFP {
     k: u32,
     mi: u32,
     h: u32,
+}
+
+#[repr(C)]
+struct AttnP {
+    h: u32,
+    hkv: u32,
+    hd: u32,
+    nkeys: u32,
+    scale: f32,
+}
+
+#[repr(C)]
+struct GdnP {
+    n: u32,
+    nk: u32,
+    nv: u32,
+    ps: u32,
+    z_off: u32,
+    b_off: u32,
+    a_off: u32,
+    eps: f32,
 }
 
 #[repr(C)]
@@ -1811,15 +2041,24 @@ pub unsafe fn dr_attn_decode(q: *const f32, kc: *const Half, vc: *const Half, ga
         return 1;
     }
     launch(st, move || {
-        flush_gpu();
         let (h, hkv, hd) = (h as usize, hkv as usize, hd as usize);
         let pos0 = (*pos_base.add(0) + pos_off) as usize;
-        let max_keys = pos0 + 1;
-        let kcv = std::slice::from_raw_parts(kc, max_keys * hkv * hd);
-        let vcv = std::slice::from_raw_parts(vc, max_keys * hkv * hd);
-        let qv = f32s(q, h * hd);
-        let gv = f32s(gate, h * hd);
-        attn_rows(qv, kcv, vcv, gv, h * hd, 1, h, hkv, hd, pos0, SendPtr(o));
+        let nkeys = pos0 + 1;
+        let prm = AttnP { h: h as u32, hkv: hkv as u32, hd: hd as u32, nkeys: nkeys as u32, scale: (hd as f32).sqrt().recip() };
+        dispatch(
+            "attn_decode",
+            &[
+                opt_buf(q as *const c_void, 0),
+                opt_buf(kc as *const c_void, 0),
+                opt_buf(vc as *const c_void, 0),
+                opt_buf(gate as *const c_void, 0),
+                opt_buf(o as *const c_void, 0),
+            ],
+            pb(&prm),
+            (h as u64, 1, 1),
+            (256, 1, 1),
+            true,
+        );
     })
 }
 
@@ -1864,75 +2103,33 @@ pub unsafe fn dr_gdn(conv: *const f32, proj: *const f32, ps: i32, z_off: i32, b_
         return 1;
     }
     launch(st, move || {
-        flush_gpu();
-        const DK: usize = 128;
-        let (n, nk, nv) = (n as usize, nk as usize, nv as usize);
-        let (ps, z_off, b_off, a_off) = (ps as usize, z_off as usize, b_off as usize, a_off as usize);
-        let cs = 2 * nk * DK + nv * DK;
-        let qscale = (DK as f32).sqrt().recip();
-        let (conv, proj, a_log, dt_bias, norm_w, state, o) =
-            (SendPtr(conv as *mut f32), SendPtr(proj as *mut f32), SendPtr(a_log as *mut f32), SendPtr(dt_bias as *mut f32), SendPtr(norm_w as *mut f32), SendPtr(state), SendPtr(o));
-        par_for!(nv, |lo, hi| {
-            for hh in lo..hi {
-            let kh = hh / (nv / nk);
-            let mut s = vec![0.0f32; DK * DK];
-            for k in 0..DK {
-                for v in 0..DK {
-                    s[k * DK + v] = unsafe { state.read(hh * DK * DK + k * DK + v) };
-                }
-            }
-            let a = -unsafe { a_log.read(hh) }.exp();
-            let dtb = unsafe { dt_bias.read(hh) };
-            let convp = conv.ptr() as *const f32;
-            let projp = proj.ptr() as *const f32;
-            for t in 0..n {
-                let cr = f32s(convp, (t + 1) * cs);
-                let cr = &cr[t * cs..];
-                let pr = f32s(projp, (t + 1) * ps);
-                let pr = &pr[t * ps..];
-                // q/k normalisation WITHOUT the head-dim average (matches k_gdn:
-                // rsqrt(sum) * qscale, not an RMSNorm).
-                let qv: Vec<f32> = (0..DK).map(|i| cr[kh * DK + i]).collect();
-                let kv: Vec<f32> = (0..DK).map(|i| cr[nk * DK + kh * DK + i]).collect();
-                let qi = qscale / (qv.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt();
-                let ki = 1.0 / (kv.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt();
-                let mut qs = vec![0.0f32; DK];
-                let mut ks = vec![0.0f32; DK];
-                for i in 0..DK {
-                    qs[i] = qv[i] * qi;
-                    ks[i] = kv[i] * ki;
-                }
-                let vv: Vec<f32> = (0..DK).map(|v| cr[2 * nk * DK + hh * DK + v]).collect();
-                let decay = (a * softplus(pr[a_off + hh] + dtb)).exp();
-                let beta = sigmoid(pr[b_off + hh]);
-                let mut outv = vec![0.0f32; DK];
-                for v in 0..DK {
-                    let mut kvm = 0.0f32;
-                    for k in 0..DK {
-                        s[k * DK + v] *= decay;
-                        kvm += s[k * DK + v] * ks[k];
-                    }
-                    let delta = (vv[v] - kvm) * beta;
-                    let mut oacc = 0.0f32;
-                    for k in 0..DK {
-                        s[k * DK + v] += ks[k] * delta;
-                        oacc += s[k * DK + v] * qs[k];
-                    }
-                    outv[v] = oacc;
-                }
-                let zr: Vec<f32> = (0..DK).map(|v| pr[z_off + hh * DK + v]).collect();
-                let inv = rms_inv(&outv, eps);
-                for v in 0..DK {
-                    unsafe { o.write(t * nv * DK + hh * DK + v, outv[v] * inv * norm_w.read(v) * silu(zr[v])); }
-                }
-            }
-            for k in 0..DK {
-                for v in 0..DK {
-                    unsafe { state.write(hh * DK * DK + k * DK + v, s[k * DK + v]); }
-                }
-            }
-            }
-        });
+        let prm = GdnP {
+            n: n as u32, nk: nk as u32, nv: nv as u32, ps: ps as u32,
+            z_off: z_off as u32, b_off: b_off as u32, a_off: a_off as u32, eps,
+        };
+        dispatch(
+            "gdn",
+            &[
+                opt_buf(conv as *const c_void, 0),
+                opt_buf(proj as *const c_void, 0),
+                opt_buf(a_log as *const c_void, 0),
+                opt_buf(dt_bias as *const c_void, 0),
+                opt_buf(norm_w as *const c_void, 0),
+                opt_buf(state as *const c_void, 0),
+                opt_buf(o as *const c_void, 0),
+            ],
+            pb(&prm),
+            (nv as u64, 1, 1),
+            (128, 1, 1),
+            true,
+        );
+        if std::env::var("DRAMA_DEBUG_GDN").is_ok() {
+            flush_gpu();
+            let oo = unsafe { std::slice::from_raw_parts(o as *const f32, (n as usize) * (nv as usize) * 128) };
+            let bad = oo.iter().filter(|x| !x.is_finite()).count();
+            let mx = oo.iter().cloned().fold(0f32, |a, x| if x.is_finite() { a.max(x.abs()) } else { a });
+            eprintln!("GDN-OUT n={} nv={} bad={} maxabs={:.3}", n, nv, bad, mx);
+        }
     })
 }
 
