@@ -280,3 +280,99 @@ fn graph_capture_replays() {
     }
     assert_eq!(unsafe { ffi::dr_graph_destroy(exec) }, 0);
 }
+
+fn f16_bits_test(v: f32) -> u16 {
+    // round-to-nearest f16 for the test oracle (finite values only)
+    let b = v.to_bits();
+    let s = (b >> 16) & 0x8000;
+    let e = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    let m = b & 0x7fffff;
+    if e <= 0 {
+        return s as u16;
+    }
+    if e >= 31 {
+        return (s | 0x7c00) as u16;
+    }
+    let m = m + 0xfff + ((m >> 13) & 1);
+    if m >= 0x800000 {
+        return (s | ((e as u32 + 1) << 10)) as u16;
+    }
+    (s | ((e as u32) << 10) | (m >> 13)) as u16
+}
+
+fn f16f_test(h: u16) -> f32 {
+    let s = (h & 0x8000) as u32;
+    let e = (h & 0x7c00) as u32;
+    let m = (h & 0x03ff) as u32;
+    let bits = if e == 0 {
+        if m == 0 {
+            s << 16
+        } else {
+            (s << 16) | 0x38000000
+        }
+    } else if e == 0x7c00 {
+        (s << 16) | 0x7f800000
+    } else {
+        (s << 16) | (((e >> 10) + 112) << 23) | (m << 13)
+    };
+    f32::from_bits(bits)
+}
+
+fn gemv_q8_case(n: usize, k: usize, norm: bool, with_res: bool) {
+    let s = st();
+    let mut rng = Rng(0xbeef + n as u64 * 100003 + k as u64);
+    // weights incl. negatives (catches char-signedness bugs), scales positive
+    let q: Vec<i8> = (0..n * k).map(|_| (rng.next() % 256) as u8 as i8).collect();
+    let sc: Vec<u16> = (0..n * (k / 128)).map(|i| f16_bits_test(0.02 * (1.0 + (i % 5) as f32 * 0.1))).collect();
+    let x: Vec<f32> = (0..k).map(|_| rng.f32() * 2.0).collect();
+    let nw: Vec<f32> = (0..k).map(|_| 0.5 + rng.f32().abs()).collect();
+    let res: Vec<f32> = (0..n).map(|_| rng.f32()).collect();
+    let qp = alloc(n * k, s, Some(&bytes_of(&q)));
+    let sp = alloc(sc.len() * 2, s, Some(&bytes_of(&sc)));
+    let xp = alloc(k * 4, s, Some(&bytes_of(&x)));
+    let np = alloc(k * 4, s, Some(&bytes_of(&nw)));
+    let rp = alloc(n * 4, s, Some(&bytes_of(&res)));
+    let yp = alloc(n * 4, s, None);
+    assert_eq!(
+        unsafe {
+            ffi::dr_gemv_q8(
+                qp as *const i8, sp as *const u16, xp as *const f32,
+                if with_res { rp as *const f32 } else { std::ptr::null() },
+                yp as *mut f32, n as i32, k as i32,
+                if norm { np as *const f32 } else { std::ptr::null() }, 1e-5,
+                std::ptr::null(), 0, s,
+            )
+        },
+        0
+    );
+    let y: Vec<f32> = down(yp, n, s);
+    let inv = if norm {
+        // matches stage_x_norm: norm over raw x, then fuse the weight
+        (x.iter().map(|v| v * v).sum::<f32>() / k as f32 + 1e-5).sqrt().recip()
+    } else {
+        1.0
+    };
+    let xn: Vec<f32> = if norm {
+        x.iter().zip(nw.iter()).map(|(a, b)| a * inv * b).collect()
+    } else {
+        x.clone()
+    };
+    for r in 0..n {
+        let mut want = 0.0f32;
+        for j in 0..k {
+            want += q[r * k + j] as f32 * f16f_test(sc[r * (k / 128) + j / 128]) * xn[j];
+        }
+        if with_res {
+            want += res[r];
+        }
+        assert!((y[r] - want).abs() < 1e-2 * want.abs().max(1.0), "row {r} n={n} k={k}: {} vs {want}", y[r]);
+    }
+}
+
+#[test]
+fn gemv_q8_matches_cpu() {
+    gemv_q8_case(130, 2048, false, false);
+    gemv_q8_case(65, 2048, true, true);
+    gemv_q8_case(17, 512, true, false);
+    gemv_q8_case(9, 4096, false, true);
+}

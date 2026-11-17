@@ -173,9 +173,60 @@ fn launch(st: Stream, f: impl Fn() + 'static) -> i32 {
 // ---------------------------------------------------------------------------
 // small helpers shared by the CPU reference ops
 
-#[inline]
-fn f32_at(p: *const f32, i: usize) -> f32 {
-    unsafe { *p.add(i) }
+/// A raw device pointer that may cross thread boundaries (`Send` instead of
+/// the raw pointer, which is not `Send` on this toolchain). Sound when threads
+/// touch disjoint memory, or shared memory read-only — the case in every
+/// `par_for!` site below (each thread owns its row range; weights are read-only).
+#[derive(Clone, Copy)]
+struct SendPtr<T>(*mut T);
+unsafe impl<T> Send for SendPtr<T> {}
+impl<T: Copy> SendPtr<T> {
+    #[inline]
+    unsafe fn read(self, i: usize) -> T {
+        *self.0.add(i)
+    }
+    #[inline]
+    unsafe fn write(self, i: usize, v: T) {
+        *self.0.add(i) = v;
+    }
+    #[inline]
+    fn is_null(self) -> bool {
+        self.0.is_null()
+    }
+    #[inline]
+    fn ptr(self) -> *mut T {
+        self.0
+    }
+    /// Signed offset (for history reads before a buffer's nominal start).
+    #[inline]
+    fn at(self, i: isize) -> *mut T {
+        unsafe { self.0.offset(i) }
+    }
+}
+
+/// Parallel row-range loop over `0..n` with std threads. Expands at the call
+/// site, so the worker closure only needs `Send` (raw device pointers qualify);
+/// all other captures must be `Copy` as each thread gets its own copy.
+/// Callers must ensure ranges write disjoint memory.
+macro_rules! par_for {
+    ($n:expr, |$lo:ident, $hi:ident| $body:block) => {{
+        let n__ = $n;
+        if n__ > 0 {
+            let threads__ = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).min(n__).max(1);
+            if threads__ <= 1 {
+                let ($lo, $hi) = (0usize, n__);
+                $body
+            } else {
+                let chunk__ = (n__ + threads__ - 1) / threads__;
+                std::thread::scope(|scope__| {
+                    for t__ in 0..threads__ {
+                        let ($lo, $hi) = (t__ * chunk__, ((t__ + 1) * chunk__).min(n__));
+                        scope__.spawn(move || $body);
+                    }
+                });
+            }
+        }
+    }};
 }
 
 #[inline]
@@ -289,6 +340,38 @@ kernel void rmsnorm(device const float* x [[buffer(0)]],
 }
 
 struct GemvP { uint n; uint k; };
+struct GemvQ8P { uint n; uint k; };
+kernel void gemv_q8(device const uchar* W [[buffer(0)]],
+                    device const ushort* S [[buffer(1)]],
+                    device const float* x [[buffer(2)]],
+                    device const float* res [[buffer(3)]],
+                    device float* y [[buffer(4)]],
+                    constant GemvQ8P& p [[buffer(5)]],
+                    uint3 tpg [[threads_per_threadgroup]],
+                    uint3 tid [[thread_position_in_threadgroup]],
+                    uint3 gid [[threadgroup_position_in_grid]]) {
+    uint r = gid.x;
+    if (r >= p.n) return;
+    uint k = p.k;
+    uint ng = k / 128;
+    float acc = 0.0f;
+    for (uint j = tid.x; j < k; j += tpg.x) {
+        // W is int8; read as unsigned and fix the sign explicitly so this does
+        // not depend on the implementation-defined signedness of `char`.
+        uint u = W[r * k + j];
+        float wv = (float)(int)u - 256.0f * (float)(u >> 7);
+        float s = (float)as_type<half>(S[r * ng + j / 128]);
+        acc += wv * s * x[j];
+    }
+    threadgroup float part[256];
+    part[tid.x] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tpg.x >> 1; s > 0; s >>= 1) {
+        if (tid.x < s) part[tid.x] += part[tid.x + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid.x == 0) y[r] = part[0] + (res != nullptr ? res[r] : 0.0f);
+}
 kernel void gemv_bf16(device const ushort* W [[buffer(0)]],
                       device const float* x [[buffer(1)]],
                       device float* y [[buffer(2)]],
@@ -354,6 +437,12 @@ struct NormP {
 
 #[repr(C)]
 struct GemvP {
+    n: u32,
+    k: u32,
+}
+
+#[repr(C)]
+struct GemvQ8P {
     n: u32,
     k: u32,
 }
@@ -665,21 +754,20 @@ pub unsafe fn dr_gemm(_h: *mut c_void, a: *const Half, w: *const Half, c: *mut f
         return 0;
     }
     let (m, n, k) = (m as usize, n as usize, k as usize);
-    let av = std::slice::from_raw_parts(a, m * k);
-    let wv = std::slice::from_raw_parts(w, n * k);
-    let cv = std::slice::from_raw_parts_mut(c, m * n);
-    for r in 0..m {
-        for cc in 0..n {
-            let mut acc = 0.0f32;
-            let arow = &av[r * k..(r + 1) * k];
-            let wrow = &wv[cc * k..(cc + 1) * k];
-            for j in 0..k {
-                acc += bf16_to_f32(arow[j]) * bf16_to_f32(wrow[j]);
+    let (a, w, c) = (SendPtr(a as *mut Half), SendPtr(w as *mut Half), SendPtr(c));
+    par_for!(m, |lo, hi| {
+        for r in lo..hi {
+            for cc in 0..n {
+                let mut acc = 0.0f32;
+                for j in 0..k {
+                    acc += bf16_to_f32(unsafe { a.read(r * k + j) }) * bf16_to_f32(unsafe { w.read(cc * k + j) });
+                }
+                unsafe {
+                    c.write(r * n + cc, acc + beta * c.read(r * n + cc));
+                }
             }
-            let o = &mut cv[r * n + cc];
-            *o = acc + beta * *o;
         }
-    }
+    });
     0
 }
 
@@ -689,21 +777,20 @@ pub unsafe fn dr_gemm_f16(_h: *mut c_void, a: *const Half, w: *const Half, c: *m
         return 0;
     }
     let (m, n, k) = (m as usize, n as usize, k as usize);
-    let av = std::slice::from_raw_parts(a, m * k);
-    let wv = std::slice::from_raw_parts(w, n * k);
-    let cv = std::slice::from_raw_parts_mut(c, m * n);
-    for r in 0..m {
-        for cc in 0..n {
-            let mut acc = 0.0f32;
-            let arow = &av[r * k..(r + 1) * k];
-            let wrow = &wv[cc * k..(cc + 1) * k];
-            for j in 0..k {
-                acc += f16_to_f32(arow[j]) * f16_to_f32(wrow[j]);
+    let (a, w, c) = (SendPtr(a as *mut Half), SendPtr(w as *mut Half), SendPtr(c));
+    par_for!(m, |lo, hi| {
+        for r in lo..hi {
+            for cc in 0..n {
+                let mut acc = 0.0f32;
+                for j in 0..k {
+                    acc += f16_to_f32(unsafe { a.read(r * k + j) }) * f16_to_f32(unsafe { w.read(cc * k + j) });
+                }
+                unsafe {
+                    c.write(r * n + cc, acc + beta * c.read(r * n + cc));
+                }
             }
-            let o = &mut cv[r * n + cc];
-            *o = acc + beta * *o;
         }
-    }
+    });
     0
 }
 
@@ -923,17 +1010,6 @@ fn norm_fused(x: &[f32], nw: Option<&[f32]>, eps: f32) -> Vec<f32> {
     }
 }
 
-/// int8 row dot, group-128 f16 scales.
-fn dot_q8_row(q: &[i8], s: &[u16], k: usize, row: usize, x: &[f32]) -> f32 {
-    let qs = &q[row * k..(row + 1) * k];
-    let ss = &s[row * (k / 128)..];
-    let mut acc = 0.0f32;
-    for (j, &qv) in qs.iter().enumerate() {
-        acc += qv as f32 * f16_to_f32(ss[j / 128]) * x[j];
-    }
-    acc
-}
-
 /// int4 asymmetric row dot, group-64 (f16 scale + f16 min per group).
 fn dot_q4_row(q: &[u8], sm: &[u16], k: usize, row: usize, x: &[f32]) -> f32 {
     let qb = &q[row * (k / 2)..(row + 1) * (k / 2)];
@@ -955,20 +1031,29 @@ fn dot_bf16_row(w: &[u16], k: usize, row: usize, x: &[f32]) -> f32 {
 }
 
 /// CPU: y[n] = W[n] . norm(x) (+ res[n]); fused RMSNorm when `nw` is set.
+/// MSL: y[n] = W[n] . norm(x) (+ res[n]); fused RMSNorm when `nw` is set.
 pub unsafe fn dr_gemv_q8(w: *const i8, s: *const Half, x: *const f32, res: *const f32, y: *mut f32, n: i32, k: i32, nw: *const f32, eps: f32, _pf: *const c_char, _pfb: usize, st: Stream) -> i32 {
     launch(st, move || {
         let (n, k) = (n as usize, k as usize);
-        let q = std::slice::from_raw_parts(w, n * k);
-        let ss = std::slice::from_raw_parts(s, n * (k / 128));
-        let xv = f32s(x, k);
-        let xn = norm_fused(xv, if nw.is_null() { None } else { Some(f32s(nw, k)) }, eps);
-        for row in 0..n {
-            let mut v = dot_q8_row(q, ss, k, row, &xn);
-            if !res.is_null() {
-                v += *res.add(row);
-            }
-            *y.add(row) = v;
-        }
+        let xv: (MBuf, u64) = if nw.is_null() {
+            require(x as *const c_void)
+        } else {
+            let (sb, soff) = scratch_f32(k);
+            let nwb = require(nw as *const c_void);
+            let xb = require(x as *const c_void);
+            let prm = NormP { rows: 1, d: k as u32, eps };
+            dispatch("rmsnorm", &[Some(xb), Some(nwb), Some((sb.clone(), soff)), None], pb(&prm), (1, 1, 1), (256, 1, 1), true);
+            (sb, soff)
+        };
+        let prm = GemvQ8P { n: n as u32, k: k as u32 };
+        dispatch(
+            "gemv_q8",
+            &[opt_buf(w as *const c_void, 0), opt_buf(s as *const c_void, 0), Some(xv), opt_buf(res as *const c_void, 0), opt_buf(y as *const c_void, 0)],
+            pb(&prm),
+            (n as u64, 1, 1),
+            (256, 1, 1),
+            true,
+        );
     })
 }
 
@@ -976,14 +1061,16 @@ pub unsafe fn dr_gemv_q8(w: *const i8, s: *const Half, x: *const f32, res: *cons
 pub unsafe fn dr_gemv_q8_swiglu(w: *const i8, s: *const Half, x: *const f32, y: *mut f32, i: i32, k: i32, nw: *const f32, eps: f32, _pf: *const c_char, _pfb: usize, st: Stream) -> i32 {
     launch(st, move || {
         let (i, k) = (i as usize, k as usize);
-        let q = std::slice::from_raw_parts(w, 2 * i * k);
-        let ss = std::slice::from_raw_parts(s, 2 * i * (k / 128));
         let xn = norm_fused(f32s(x, k), if nw.is_null() { None } else { Some(f32s(nw, k)) }, eps);
-        for j in 0..i {
-            let g = dot_q8_row(q, ss, k, j, &xn);
-            let u = dot_q8_row(q, ss, k, i + j, &xn);
-            *y.add(j) = silu(g) * u;
-        }
+        let (w, s, y) = (SendPtr(w as *mut i8), SendPtr(s as *mut Half), SendPtr(y));
+        let xn: &[f32] = &xn;
+        par_for!(i, |lo, hi| {
+            for j in lo..hi {
+                let g = unsafe { dot_q8_ptr(w, s, k, j, &xn) };
+                let u = unsafe { dot_q8_ptr(w, s, k, i + j, &xn) };
+                unsafe { y.write(j, silu(g) * u); }
+            }
+        });
     })
 }
 
@@ -1011,6 +1098,28 @@ pub unsafe fn dr_router_topk(w: *const Half, x: *const f32, nw: *const f32, eps:
     })
 }
 
+/// int4 asymmetric row dot with raw pointers: expert tensors are larger than any
+/// bound visible at the call site (indexed by global expert id), so the engine's
+/// guarantee is used directly instead of a pre-sized slice.
+unsafe fn dot_q4_ptr(q: SendPtr<u8>, sm: SendPtr<u16>, k: usize, row: usize, x: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    for (j, &xv) in x.iter().enumerate().take(k) {
+        let g = j / 64;
+        let qq = ((q.read(row * (k / 2) + j / 2) >> ((j & 1) * 4)) & 15) as f32;
+        acc += (qq * f16_to_f32(sm.read(row * (k / 64) * 2 + g * 2)) + f16_to_f32(sm.read(row * (k / 64) * 2 + g * 2 + 1))) * xv;
+    }
+    acc
+}
+
+/// int8 row dot with raw pointers (same reason as `dot_q4_ptr`).
+unsafe fn dot_q8_ptr(q: SendPtr<i8>, s: SendPtr<u16>, k: usize, row: usize, x: &[f32]) -> f32 {
+    let mut acc = 0.0f32;
+    for (j, &xv) in x.iter().enumerate().take(k) {
+        acc += (q.read(row * k + j) as f32) * f16_to_f32(s.read(row * (k / 128) + j / 128)) * xv;
+    }
+    acc
+}
+
 /// CPU: decode MoE — routed q4 experts + shared q8 expert.
 /// Requires H == 2048, I == 512, topk == 8 (same limits as CUDA).
 #[allow(clippy::too_many_arguments)]
@@ -1021,50 +1130,50 @@ pub unsafe fn dr_moe_decode(gu_q: *const u8, gu_sm: *const Half, d_q: *const u8,
     launch(st, move || {
         let (h, mi, topk) = (h as usize, i as usize, topk as usize);
         let k = h; // K = H = 2048 for gate_up rows
-        let gq = std::slice::from_raw_parts(gu_q, 8 * 2 * mi * (k / 2));
-        let gs = std::slice::from_raw_parts(gu_sm, 8 * 2 * mi * (k / 64) * 2);
-        let dq = std::slice::from_raw_parts(d_q, 8 * h * (mi / 2));
-        let ds = std::slice::from_raw_parts(d_sm, 8 * h * (mi / 64) * 2);
-        let sgq = std::slice::from_raw_parts(sgu_q, 2 * mi * k);
-        let sgs = std::slice::from_raw_parts(sgu_s, 2 * mi * (k / 128));
-        let sdq = std::slice::from_raw_parts(sd_q, h * mi);
-        let sds = std::slice::from_raw_parts(sd_s, h * (mi / 128));
+        // NOTE: gu/d weight tensors hold ALL experts ([E, ...]); rows are addressed
+        // by global expert id via raw pointers (see dot_q4_ptr).
         let xn = norm_fused(f32s(x, k), if nw.is_null() { None } else { Some(f32s(nw, k)) }, eps);
         // gate_up: routed experts then shared (slot topk)
+        let (gu_q, gu_sm, sgu_q, sgu_s) = (SendPtr(gu_q as *mut u8), SendPtr(gu_sm as *mut Half), SendPtr(sgu_q as *mut i8), SendPtr(sgu_s as *mut Half));
         for kk in 0..topk {
-            let e = *idx.add(kk) as usize;
+            let e = unsafe { *idx.add(kk) } as usize;
             for j in 0..mi {
-                let g = dot_q4_row(gq, gs, k, e * 2 * mi + j, &xn);
-                let u = dot_q4_row(gq, gs, k, e * 2 * mi + mi + j, &xn);
-                *act.add(kk * mi + j) = silu(g) * u;
+                let g = unsafe { dot_q4_ptr(gu_q, gu_sm, k, e * 2 * mi + j, &xn) };
+                let u = unsafe { dot_q4_ptr(gu_q, gu_sm, k, e * 2 * mi + mi + j, &xn) };
+                unsafe { *act.add(kk * mi + j) = silu(g) * u; }
             }
         }
         for j in 0..mi {
-            let g = dot_q8_row(sgq, sgs, k, j, &xn);
-            let u = dot_q8_row(sgq, sgs, k, mi + j, &xn);
-            *act.add(topk * mi + j) = silu(g) * u;
+            let g = unsafe { dot_q8_ptr(sgu_q, sgu_s, k, j, &xn) };
+            let u = unsafe { dot_q8_ptr(sgu_q, sgu_s, k, mi + j, &xn) };
+            unsafe { *act.add(topk * mi + j) = silu(g) * u; }
         }
-        // down
-        let sg = sigmoid(*sgate.add(0));
-        let wv: Vec<f32> = (0..topk).map(|kk| *wts.add(kk)).collect();
-        for n in 0..h {
-            let mut acc = 0.0f32;
-            for kk in 0..topk {
-                let e = *idx.add(kk) as usize;
-                let mut qx = 0.0f32;
-                for j in 0..mi {
-                    let aval = *act.add(kk * mi + j);
-                    let qb = dq[(e * h + n) * (mi / 2) + j / 2];
-                    let qq = ((qb >> ((j & 1) * 4)) & 15) as f32;
-                    let g = j / 64;
-                    let smb = &ds[(e * h + n) * (mi / 64) * 2..];
-                    qx += (qq * f16_to_f32(smb[g * 2]) + f16_to_f32(smb[g * 2 + 1])) * aval;
+        // down (rows are independent)
+        let sg = sigmoid(unsafe { *sgate.add(0) });
+        let act_shared: &[f32] = unsafe { std::slice::from_raw_parts(act.add(topk * mi), mi) };
+        let (d_q, d_sm, sd_q, sd_s) = (SendPtr(d_q as *mut u8), SendPtr(d_sm as *mut Half), SendPtr(sd_q as *mut i8), SendPtr(sd_s as *mut Half));
+        let (wts, idx, res, y, act) = (SendPtr(wts as *mut f32), SendPtr(idx as *mut i32), SendPtr(res as *mut f32), SendPtr(y), SendPtr(act));
+        par_for!(h, |lo, hi| {
+            for n in lo..hi {
+                let mut acc = 0.0f32;
+                for kk in 0..topk {
+                    let e = unsafe { idx.read(kk) } as usize;
+                    let mut qx = 0.0f32;
+                    for j in 0..mi {
+                        let aval = unsafe { act.read(kk * mi + j) };
+                        let qb = unsafe { d_q.read((e * h + n) * (mi / 2) + j / 2) };
+                        let qq = ((qb >> ((j & 1) * 4)) & 15) as f32;
+                        let g = j / 64;
+                        let s0 = unsafe { d_sm.read((e * h + n) * (mi / 64) * 2 + g * 2) };
+                        let s1 = unsafe { d_sm.read((e * h + n) * (mi / 64) * 2 + g * 2 + 1) };
+                        qx += unsafe { (qq * f16_to_f32(s0) + f16_to_f32(s1)) * aval };
+                    }
+                    acc += unsafe { wts.read(kk) } * qx;
                 }
-                acc += wv[kk] * qx;
+                let sh = unsafe { dot_q8_ptr(sd_q, sd_s, mi, n, act_shared) };
+                unsafe { y.write(n, res.read(n) + sg * sh + acc); }
             }
-            let sh = dot_q8_row(sdq, sds, mi, n, std::slice::from_raw_parts(act.add(topk * mi), mi));
-            *y.add(n) = *res.add(n) + sg * sh + acc;
-        }
+        });
     })
 }
 
@@ -1080,28 +1189,49 @@ pub unsafe fn dr_moe_prefill(gu_q: *const u8, gu_sm: *const Half, d_q: *const u8
         let gs = std::slice::from_raw_parts(gu_sm, e * 2 * mi * (k / 64) * 2);
         let dq = std::slice::from_raw_parts(d_q, e * h * (mi / 2));
         let ds = std::slice::from_raw_parts(d_sm, e * h * (mi / 64) * 2);
-        let xpv_len = (0..e).map(|ex| *counts.add(ex) as usize).sum::<usize>().max(1) * k;
-        let xpv = std::slice::from_raw_parts(xp, xpv_len);
+        let _ = offsets;
+        let xpv_len = (0..e).map(|ex| unsafe { *counts.add(ex) } as usize).sum::<usize>().max(1) * k;
+        let xpv = unsafe { std::slice::from_raw_parts(xp, xpv_len) };
+        let (counts, act, y) = (SendPtr(counts as *mut i32), SendPtr(act), SendPtr(y));
+        // Flatten (expert, token) pairs into uniform slots: MoE routing is
+        // skewed (a few experts own most rows), so static expert ranges would
+        // leave most threads idle. Every slot costs identical FLOPs.
+        let mut slot_expert: Vec<usize> = Vec::new();
         for ex in 0..e {
-            let cnt = *counts.add(ex) as usize;
-            let off = *offsets.add(ex) as usize;
-            for t in 0..cnt {
-                let slot = off + t;
+            let cnt = unsafe { counts.read(ex) } as usize;
+            slot_expert.extend(std::iter::repeat(ex).take(cnt));
+        }
+        let total = slot_expert.len();
+        let slot_expert: &[usize] = &slot_expert;
+        // gate_up per slot: act[slot] = silu(G_e . x) * (U_e . x) in bf16.
+        // Slots are global indices: offsets[] are prefix sums, so slot s written
+        // by expert slot_expert[s] lands exactly at act[s] / y[s].
+        par_for!(total, |lo, hi| {
+            for s in lo..hi {
+                let ex = slot_expert[s];
+                let slot = s;
                 let xr: Vec<f32> = xpv[slot * k..(slot + 1) * k].iter().map(|&v| bf16_to_f32(v)).collect();
                 for j in 0..mi {
                     let g = dot_q4_row(gq, gs, k, ex * 2 * mi + j, &xr);
                     let u = dot_q4_row(gq, gs, k, ex * 2 * mi + mi + j, &xr);
-                    *act.add(slot * mi + j) = f32_to_bf16_rn(silu(g) * u);
+                    unsafe { act.write(slot * mi + j, f32_to_bf16_rn(silu(g) * u)); }
                 }
             }
-            for t in 0..cnt {
-                let slot = off + t;
-                let ar: Vec<f32> = (0..mi).map(|j| bf16_to_f32(*act.add(slot * mi + j))).collect();
+        });
+        // down per slot: y[slot] = D_e . act[slot] (f32).
+        par_for!(total, |lo, hi| {
+            for s in lo..hi {
+                let ex = slot_expert[s];
+                let slot = s;
+                let mut ar: Vec<f32> = Vec::with_capacity(mi);
+                for j in 0..mi {
+                    ar.push(bf16_to_f32(unsafe { act.read(slot * mi + j) }));
+                }
                 for n in 0..h {
-                    *y.add(slot * h + n) = dot_q4_row(dq, ds, mi, ex * h + n, &ar);
+                    unsafe { y.write(slot * h + n, dot_q4_row(dq, ds, mi, ex * h + n, &ar)); }
                 }
             }
-        }
+        });
     })
 }
 
@@ -1265,41 +1395,43 @@ pub unsafe fn dr_qk_norm_rope(qkv: *const f32, rs: i32, rows: i32, h: i32, hkv: 
 
 /// Shared softmax attention over cached keys/values: out = softmax(qK/sqrt(hd))V / L,
 /// multiplied by sigmoid(gate). `nrows` query rows starting at `pos0`.
-unsafe fn attn_rows(q: &[f32], kc: &[u16], vc: &[u16], gate: &[f32], gate_stride: usize, nrows: usize, h: usize, hkv: usize, hd: usize, pos0: usize, out: &mut [f32]) {
+unsafe fn attn_rows(q: &[f32], kc: &[u16], vc: &[u16], gate: &[f32], gate_stride: usize, nrows: usize, h: usize, hkv: usize, hd: usize, pos0: usize, out: SendPtr<f32>) {
     let scale = (hd as f32).sqrt().recip();
     let g = h / hkv;
-    for r in 0..nrows {
-        let nkeys = pos0 + r + 1;
-        for hh in 0..h {
-            let kh = hh / g;
-            let qr = &q[r * h * hd + hh * hd..(r + 1) * h * hd];
-            let qr = &qr[..hd];
-            // Scores then online softmax.
-            let mut m = f32::NEG_INFINITY;
-            let mut l = 0.0f32;
-            let mut acc = vec![0.0f32; hd];
-            for j in 0..nkeys {
-                let base = (j * hkv + kh) * hd;
-                let mut s = 0.0f32;
-                for d in 0..hd {
-                    s += qr[d] * bf16_to_f32(kc[base + d]);
+    par_for!(nrows, |lo, hi| {
+        for r in lo..hi {
+            let nkeys = pos0 + r + 1;
+            for hh in 0..h {
+                let kh = hh / g;
+                let qr = &q[r * h * hd + hh * hd..(r + 1) * h * hd];
+                let qr = &qr[..hd];
+                // Scores then online softmax.
+                let mut m = f32::NEG_INFINITY;
+                let mut l = 0.0f32;
+                let mut acc = vec![0.0f32; hd];
+                for j in 0..nkeys {
+                    let base = (j * hkv + kh) * hd;
+                    let mut s = 0.0f32;
+                    for d in 0..hd {
+                        s += qr[d] * bf16_to_f32(kc[base + d]);
+                    }
+                    s *= scale;
+                    let mn = m.max(s);
+                    let corr = (m - mn).exp();
+                    let p = (s - mn).exp();
+                    l = l * corr + p;
+                    for d in 0..hd {
+                        acc[d] = acc[d] * corr + p * bf16_to_f32(vc[base + d]);
+                    }
+                    m = mn;
                 }
-                s *= scale;
-                let mn = m.max(s);
-                let corr = (m - mn).exp();
-                let p = (s - mn).exp();
-                l = l * corr + p;
                 for d in 0..hd {
-                    acc[d] = acc[d] * corr + p * bf16_to_f32(vc[base + d]);
+                    let gv = gate[r * gate_stride + hh * hd + d];
+                    out.write(r * h * hd + hh * hd + d, acc[d] / l * sigmoid(gv));
                 }
-                m = mn;
-            }
-            for d in 0..hd {
-                let gv = gate[r * gate_stride + hh * hd + d];
-                out[r * h * hd + hh * hd + d] = acc[d] / l * sigmoid(gv);
             }
         }
-    }
+    });
 }
 
 /// CPU: prefill attention over keys 0..pos+r.
@@ -1316,8 +1448,7 @@ pub unsafe fn dr_attn_prefill(q: *const f32, kc: *const Half, vc: *const Half, g
         let vcv = std::slice::from_raw_parts(vc, max_keys * hkv * hd);
         let qv = f32s(q, rows * h * hd);
         let gv = f32s(gate, rows * gate_stride as usize);
-        let ov = std::slice::from_raw_parts_mut(o, rows * h * hd);
-        attn_rows(qv, kcv, vcv, gv, gate_stride as usize, rows, h, hkv, hd, pos0, ov);
+        attn_rows(qv, kcv, vcv, gv, gate_stride as usize, rows, h, hkv, hd, pos0, SendPtr(o));
     })
 }
 
@@ -1334,8 +1465,7 @@ pub unsafe fn dr_attn_decode(q: *const f32, kc: *const Half, vc: *const Half, ga
         let vcv = std::slice::from_raw_parts(vc, max_keys * hkv * hd);
         let qv = f32s(q, h * hd);
         let gv = f32s(gate, h * hd);
-        let ov = std::slice::from_raw_parts_mut(o, h * hd);
-        attn_rows(qv, kcv, vcv, gv, h * hd, 1, h, hkv, hd, pos0, ov);
+        attn_rows(qv, kcv, vcv, gv, h * hd, 1, h, hkv, hd, pos0, SendPtr(o));
     })
 }
 
@@ -1346,20 +1476,25 @@ pub unsafe fn dr_attn_decode(q: *const f32, kc: *const Half, vc: *const Half, ga
 pub unsafe fn dr_conv(input: *const f32, in_stride: i32, w: *const f32, state: *mut f32, out: *mut f32, n: i32, c: i32, st: Stream) -> i32 {
     launch(st, move || {
         let (n, c, ins) = (n as usize, c as usize, in_stride as usize);
-        for ch in 0..c {
-            let mut h = [*state.add(ch * 3), *state.add(ch * 3 + 1), *state.add(ch * 3 + 2)];
-            let wv = [f32_at(w, ch * 4), f32_at(w, ch * 4 + 1), f32_at(w, ch * 4 + 2), f32_at(w, ch * 4 + 3)];
-            for t in 0..n {
-                let xt = *input.add(t * ins + ch);
-                *out.add(t * c + ch) = silu(wv[0] * h[0] + wv[1] * h[1] + wv[2] * h[2] + wv[3] * xt);
-                h[0] = h[1];
-                h[1] = h[2];
-                h[2] = xt;
+        let (input, w, state, out) = (SendPtr(input as *mut f32), SendPtr(w as *mut f32), SendPtr(state), SendPtr(out));
+        par_for!(c, |lo, hi| {
+            for ch in lo..hi {
+                let mut h = unsafe { [state.read(ch * 3), state.read(ch * 3 + 1), state.read(ch * 3 + 2)] };
+                let wv = unsafe { [w.read(ch * 4), w.read(ch * 4 + 1), w.read(ch * 4 + 2), w.read(ch * 4 + 3)] };
+                for t in 0..n {
+                    let xt = unsafe { input.read(t * ins + ch) };
+                    unsafe { out.write(t * c + ch, silu(wv[0] * h[0] + wv[1] * h[1] + wv[2] * h[2] + wv[3] * xt)); }
+                    h[0] = h[1];
+                    h[1] = h[2];
+                    h[2] = xt;
+                }
+                unsafe {
+                    state.write(ch * 3, h[0]);
+                    state.write(ch * 3 + 1, h[1]);
+                    state.write(ch * 3 + 2, h[2]);
+                }
             }
-            *state.add(ch * 3) = h[0];
-            *state.add(ch * 3 + 1) = h[1];
-            *state.add(ch * 3 + 2) = h[2];
-        }
+        });
     })
 }
 
@@ -1379,26 +1514,32 @@ pub unsafe fn dr_gdn(conv: *const f32, proj: *const f32, ps: i32, z_off: i32, b_
         let (ps, z_off, b_off, a_off) = (ps as usize, z_off as usize, b_off as usize, a_off as usize);
         let cs = 2 * nk * DK + nv * DK;
         let qscale = (DK as f32).sqrt().recip();
-        for hh in 0..nv {
+        let (conv, proj, a_log, dt_bias, norm_w, state, o) =
+            (SendPtr(conv as *mut f32), SendPtr(proj as *mut f32), SendPtr(a_log as *mut f32), SendPtr(dt_bias as *mut f32), SendPtr(norm_w as *mut f32), SendPtr(state), SendPtr(o));
+        par_for!(nv, |lo, hi| {
+            for hh in lo..hi {
             let kh = hh / (nv / nk);
             let mut s = vec![0.0f32; DK * DK];
             for k in 0..DK {
                 for v in 0..DK {
-                    s[k * DK + v] = *state.add(hh * DK * DK + k * DK + v);
+                    s[k * DK + v] = unsafe { state.read(hh * DK * DK + k * DK + v) };
                 }
             }
-            let a = -f32_at(a_log, hh).exp();
-            let dtb = f32_at(dt_bias, hh);
+            let a = -unsafe { a_log.read(hh) }.exp();
+            let dtb = unsafe { dt_bias.read(hh) };
+            let convp = conv.ptr() as *const f32;
+            let projp = proj.ptr() as *const f32;
             for t in 0..n {
-                let cr = f32s(conv, (t + 1) * cs);
+                let cr = f32s(convp, (t + 1) * cs);
                 let cr = &cr[t * cs..];
-                let pr = f32s(proj, (t + 1) * ps);
+                let pr = f32s(projp, (t + 1) * ps);
                 let pr = &pr[t * ps..];
-                // q/k RMSNorm (each over 128 dims) then scaled.
+                // q/k normalisation WITHOUT the head-dim average (matches k_gdn:
+                // rsqrt(sum) * qscale, not an RMSNorm).
                 let qv: Vec<f32> = (0..DK).map(|i| cr[kh * DK + i]).collect();
                 let kv: Vec<f32> = (0..DK).map(|i| cr[nk * DK + kh * DK + i]).collect();
-                let qi = rms_inv(&qv, 1e-6) * qscale;
-                let ki = rms_inv(&kv, 1e-6);
+                let qi = qscale / (qv.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt();
+                let ki = 1.0 / (kv.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt();
                 let mut qs = vec![0.0f32; DK];
                 let mut ks = vec![0.0f32; DK];
                 for i in 0..DK {
@@ -1426,19 +1567,19 @@ pub unsafe fn dr_gdn(conv: *const f32, proj: *const f32, ps: i32, z_off: i32, b_
                 let zr: Vec<f32> = (0..DK).map(|v| pr[z_off + hh * DK + v]).collect();
                 let inv = rms_inv(&outv, eps);
                 for v in 0..DK {
-                    *o.add(t * nv * DK + hh * DK + v) = outv[v] * inv * *norm_w.add(v) * silu(zr[v]);
+                    unsafe { o.write(t * nv * DK + hh * DK + v, outv[v] * inv * norm_w.read(v) * silu(zr[v])); }
                 }
             }
             for k in 0..DK {
                 for v in 0..DK {
-                    *state.add(hh * DK * DK + k * DK + v) = s[k * DK + v];
+                    unsafe { state.write(hh * DK * DK + k * DK + v, s[k * DK + v]); }
                 }
             }
-        }
+            }
+        });
     })
 }
 
-// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // CPU reference: codec (kernels/codec.cu). Activations are time-major [T, C].
 // `x` may point into a buffer with readable history rows before it (causal
@@ -1505,19 +1646,24 @@ pub unsafe fn dr_rvq_sum(codes: *const i32, frames: i32, ncb: i32, table: *const
     launch(st, move || {
         let (frames, ncb, d) = (frames as usize, ncb as usize, d as usize);
         let (sem, res) = (sem_size as usize, res_size as usize);
-        for t in 0..frames {
-            let orow = std::slice::from_raw_parts_mut(out.add(t * d), d);
-            orow.fill(0.0);
-            for c in 0..ncb {
-                let size = if c == 0 { sem } else { res };
-                let code = (*codes.add(t * ncb + c)).clamp(0, size as i32 - 1) as usize;
-                let row = if c == 0 { code } else { sem + (c - 1) * res + code };
-                let tr = std::slice::from_raw_parts(table.add(row * d), d);
-                for (o, &v) in orow.iter_mut().zip(tr.iter()) {
-                    *o += v;
+        let out = SendPtr(out);
+        let codes = unsafe { std::slice::from_raw_parts(codes, frames * ncb) };
+        let table = unsafe { std::slice::from_raw_parts(table, (sem + (ncb - 1) * res) * d) };
+        par_for!(frames, |lo, hi| {
+            for t in lo..hi {
+                let orow = unsafe { std::slice::from_raw_parts_mut(out.ptr().add(t * d), d) };
+                orow.fill(0.0);
+                for c in 0..ncb {
+                    let size = if c == 0 { sem } else { res };
+                    let code = codes[t * ncb + c].clamp(0, size as i32 - 1) as usize;
+                    let row = if c == 0 { code } else { sem + (c - 1) * res + code };
+                    let tr = &table[row * d..(row + 1) * d];
+                    for (o, &v) in orow.iter_mut().zip(tr.iter()) {
+                        *o += v;
+                    }
                 }
             }
-        }
+        });
     })
 }
 
@@ -1526,18 +1672,21 @@ pub unsafe fn dr_im2col(x: *const f32, n: i32, c: i32, k: i32, d: i32, s: i32, a
     launch(st, move || {
         let (n, c, k, dil, strd) = (n as usize, c as usize, k as usize, d as isize, s as isize);
         let has_a = !alpha.is_null();
-        for i in 0..n * k * c {
-            let cc = i % c;
-            let tj = i / c;
-            let j = (tj % k) as isize;
-            let t = (tj / k) as isize;
-            let src = t * strd + (strd - 1) - ((k as isize - 1 - j) * dil);
-            let mut v = *x.offset(src * c as isize + cc as isize);
-            if has_a {
-                v = snake(v, *alpha.add(cc));
+        let (x, alpha, out) = (SendPtr(x as *mut f32), SendPtr(alpha as *mut f32), SendPtr(out));
+        par_for!(n * k * c, |lo, hi| {
+            for i in lo..hi {
+                let cc = i % c;
+                let tj = i / c;
+                let j = (tj % k) as isize;
+                let t = (tj / k) as isize;
+                let src = t * strd + (strd - 1) - ((k as isize - 1 - j) * dil);
+                let mut v = unsafe { *x.at(src * c as isize + cc as isize) };
+                if has_a {
+                    v = snake(v, unsafe { alpha.read(cc) });
+                }
+                unsafe { out.write(i, f32_to_f16_rn(v)); }
             }
-            *out.add(i) = f32_to_f16_rn(v);
-        }
+        });
     })
 }
 
@@ -1545,29 +1694,32 @@ pub unsafe fn dr_im2col(x: *const f32, n: i32, c: i32, k: i32, d: i32, s: i32, a
 pub unsafe fn dr_vq_encode(r: *mut f32, rows: i32, d: i32, in_w: *const f32, in_b: *const f32, codebook_n: *const f32, n: i32, table: *const f32, codes: *mut i32, code_stride: i32, st: Stream) -> i32 {
     launch(st, move || {
         let (rows, d) = (rows as usize, d as usize);
-        for row in 0..rows {
-            let rr = std::slice::from_raw_parts_mut(r.add(row * d), d);
-            let mut z = [0.0f32; 8];
-            for o in 0..8 {
-                let wr = std::slice::from_raw_parts(in_w.add(o * d), d);
-                z[o] = wr.iter().zip(rr.iter()).map(|(a, b)| a * b).sum::<f32>() + *in_b.add(o);
-            }
-            let mut best = 0i32;
-            let mut bv = f32::NEG_INFINITY;
-            for e in 0..n as usize {
-                let er = std::slice::from_raw_parts(codebook_n.add(e * 8), 8);
-                let dot: f32 = z.iter().zip(er.iter()).map(|(a, b)| a * b).sum();
-                if dot > bv {
-                    bv = dot;
-                    best = e as i32;
+        let (r, in_w, in_b, codebook_n, table, codes) = (SendPtr(r), SendPtr(in_w as *mut f32), SendPtr(in_b as *mut f32), SendPtr(codebook_n as *mut f32), SendPtr(table as *mut f32), SendPtr(codes));
+        par_for!(rows, |lo, hi| {
+            for row in lo..hi {
+                let rr = unsafe { std::slice::from_raw_parts_mut(r.ptr().add(row * d), d) };
+                let mut z = [0.0f32; 8];
+                for o in 0..8 {
+                    let wr = unsafe { std::slice::from_raw_parts(in_w.ptr().add(o * d) as *const f32, d) };
+                    z[o] = wr.iter().zip(rr.iter()).map(|(a, b)| a * b).sum::<f32>() + unsafe { in_b.read(o) };
                 }
+                let mut best = 0i32;
+                let mut bv = f32::NEG_INFINITY;
+                for e in 0..n as usize {
+                    let er = unsafe { std::slice::from_raw_parts(codebook_n.ptr().add(e * 8) as *const f32, 8) };
+                    let dot: f32 = z.iter().zip(er.iter()).map(|(a, b)| a * b).sum();
+                    if dot > bv {
+                        bv = dot;
+                        best = e as i32;
+                    }
+                }
+                let tr = unsafe { std::slice::from_raw_parts(table.ptr().add(best as usize * d) as *const f32, d) };
+                for (a, &b) in rr.iter_mut().zip(tr.iter()) {
+                    *a -= b;
+                }
+                unsafe { codes.write(row * code_stride as usize, best) };
             }
-            let tr = std::slice::from_raw_parts(table.add(best as usize * d), d);
-            for (a, &b) in rr.iter_mut().zip(tr.iter()) {
-                *a -= b;
-            }
-            *codes.add(row * code_stride as usize) = best;
-        }
+        });
     })
 }
 
@@ -1577,17 +1729,20 @@ pub unsafe fn dr_tconv_gather(x: *const f32, n: i32, c: i32, two: i32, alpha: *c
         let (n, c) = (n as usize, c as usize);
         let w = if two != 0 { 2 * c } else { c };
         let has_a = !alpha.is_null();
-        for i in 0..n * w {
-            let t = (i / w) as isize;
-            let cc = i % w;
-            let ch = cc % c;
-            let src = if cc < c { t } else { t - 1 };
-            let mut v = *x.offset(src * c as isize + ch as isize);
-            if has_a {
-                v = snake(v, *alpha.add(ch));
+        let (x, alpha, out) = (SendPtr(x as *mut f32), SendPtr(alpha as *mut f32), SendPtr(out));
+        par_for!(n * w, |lo, hi| {
+            for i in lo..hi {
+                let t = (i / w) as isize;
+                let cc = i % w;
+                let ch = cc % c;
+                let src = if cc < c { t } else { t - 1 };
+                let mut v = unsafe { *x.at(src * c as isize + ch as isize) };
+                if has_a {
+                    v = snake(v, unsafe { alpha.read(ch) });
+                }
+                unsafe { out.write(i, f32_to_f16_rn(v)); }
             }
-            *out.add(i) = f32_to_f16_rn(v);
-        }
+        });
     })
 }
 
@@ -1595,27 +1750,31 @@ pub unsafe fn dr_tconv_gather(x: *const f32, n: i32, c: i32, two: i32, alpha: *c
 pub unsafe fn dr_epilogue(y: *const f32, n: usize, c: i32, bias: *const f32, scale: *const f32, res: *const f32, act: i32, out: *mut f32, out16: *mut Half, st: Stream) -> i32 {
     launch(st, move || {
         let c = c as usize;
-        for i in 0..n {
-            let cc = i % c;
-            let mut v = *y.add(i) + if bias.is_null() { 0.0 } else { *bias.add(cc) };
-            if act == 1 {
-                v = v.tanh();
-            } else if act == 2 {
-                v = gelu_erf(v);
+        let (y, bias, scale, res, out, out16) =
+            (SendPtr(y as *mut f32), SendPtr(bias as *mut f32), SendPtr(scale as *mut f32), SendPtr(res as *mut f32), SendPtr(out), SendPtr(out16));
+        par_for!(n, |lo, hi| {
+            for i in lo..hi {
+                let cc = i % c;
+                let mut v = unsafe { y.read(i) } + if bias.is_null() { 0.0 } else { unsafe { bias.read(cc) } };
+                if act == 1 {
+                    v = v.tanh();
+                } else if act == 2 {
+                    v = gelu_erf(v);
+                }
+                if !scale.is_null() {
+                    v *= unsafe { scale.read(cc) };
+                }
+                if !res.is_null() {
+                    v += unsafe { res.read(i) };
+                }
+                if !out.is_null() {
+                    unsafe { out.write(i, v) };
+                }
+                if !out16.is_null() {
+                    unsafe { out16.write(i, f32_to_f16_rn(v)) };
+                }
             }
-            if !scale.is_null() {
-                v *= *scale.add(cc);
-            }
-            if !res.is_null() {
-                v += *res.add(i);
-            }
-            if !out.is_null() {
-                *out.add(i) = v;
-            }
-            if !out16.is_null() {
-                *out16.add(i) = f32_to_f16_rn(v);
-            }
-        }
+        });
     })
 }
 
@@ -1623,15 +1782,18 @@ pub unsafe fn dr_epilogue(y: *const f32, n: usize, c: i32, bias: *const f32, sca
 pub unsafe fn dr_dwconv(x: *const f32, t: i32, c: i32, k: i32, w: *const f32, b: *const f32, out: *mut f32, st: Stream) -> i32 {
     launch(st, move || {
         let (t, c, k) = (t as usize, c as usize, k as usize);
-        for tt in 0..t {
-            for cc in 0..c {
-                let mut acc = *b.add(cc);
-                for j in 0..k {
-                    acc += *w.add(cc * k + j) * *x.offset((tt as isize - (k - 1 - j) as isize) * c as isize + cc as isize);
+        let (x, w, b, out) = (SendPtr(x as *mut f32), SendPtr(w as *mut f32), SendPtr(b as *mut f32), SendPtr(out));
+        par_for!(t, |lo, hi| {
+            for tt in lo..hi {
+                for cc in 0..c {
+                    let mut acc = unsafe { b.read(cc) };
+                    for j in 0..k {
+                        acc += unsafe { w.read(cc * k + j) * *x.at((tt as isize - (k - 1 - j) as isize) * c as isize + cc as isize) };
+                    }
+                    unsafe { out.write(tt * c + cc, acc) };
                 }
-                *out.add(tt * c + cc) = acc;
             }
-        }
+        });
     })
 }
 
@@ -1639,14 +1801,18 @@ pub unsafe fn dr_dwconv(x: *const f32, t: i32, c: i32, k: i32, w: *const f32, b:
 pub unsafe fn dr_layernorm(x: *const f32, rows: i32, c: i32, w: *const f32, b: *const f32, eps: f32, out: *mut Half, st: Stream) -> i32 {
     launch(st, move || {
         let (rows, c) = (rows as usize, c as usize);
-        for r in 0..rows {
-            let xr = std::slice::from_raw_parts(x.add(r * c), c);
-            let mean = xr.iter().sum::<f32>() / c as f32;
-            let inv = (xr.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / c as f32 + eps).sqrt().recip();
-            for i in 0..c {
-                *out.add(r * c + i) = f32_to_f16_rn((xr[i] - mean) * inv * *w.add(i) + *b.add(i));
+        let (x, w, b, out) = (SendPtr(x as *mut f32), SendPtr(w as *mut f32), SendPtr(b as *mut f32), SendPtr(out));
+        par_for!(rows, |lo, hi| {
+            for r in lo..hi {
+                let xr = unsafe { std::slice::from_raw_parts(x.ptr() as *const f32, (r + 1) * c) };
+                let xr = &xr[r * c..];
+                let mean = xr.iter().sum::<f32>() / c as f32;
+                let inv = (xr.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / c as f32 + eps).sqrt().recip();
+                for i in 0..c {
+                    unsafe { out.write(r * c + i, f32_to_f16_rn((xr[i] - mean) * inv * w.read(i) + b.read(i))) };
+                }
             }
-        }
+        });
     })
 }
 
@@ -1654,19 +1820,23 @@ pub unsafe fn dr_layernorm(x: *const f32, rows: i32, c: i32, w: *const f32, b: *
 pub unsafe fn dr_rmsnorm_plain(x: *const f32, rows: i32, c: i32, w: *const f32, eps: f32, out: *mut f32, out16: *mut Half, st: Stream) -> i32 {
     launch(st, move || {
         let (rows, c) = (rows as usize, c as usize);
-        for r in 0..rows {
-            let xr = std::slice::from_raw_parts(x.add(r * c), c);
-            let inv = rms_inv(xr, eps);
-            for i in 0..c {
-                let v = xr[i] * inv * *w.add(i);
-                if !out.is_null() {
-                    *out.add(r * c + i) = v;
-                }
-                if !out16.is_null() {
-                    *out16.add(r * c + i) = f32_to_f16_rn(v);
+        let (x, w, out, out16) = (SendPtr(x as *mut f32), SendPtr(w as *mut f32), SendPtr(out), SendPtr(out16));
+        par_for!(rows, |lo, hi| {
+            for r in lo..hi {
+                let xr = unsafe { std::slice::from_raw_parts(x.ptr() as *const f32, (r + 1) * c) };
+                let xr = &xr[r * c..];
+                let inv = rms_inv(xr, eps);
+                for i in 0..c {
+                    let v = xr[i] * inv * unsafe { w.read(i) };
+                    if !out.is_null() {
+                        unsafe { out.write(r * c + i, v) };
+                    }
+                    if !out16.is_null() {
+                        unsafe { out16.write(r * c + i, f32_to_f16_rn(v)) };
+                    }
                 }
             }
-        }
+        });
     })
 }
 
@@ -1676,29 +1846,34 @@ pub unsafe fn dr_codec_rope(qkv: *const f32, n: i32, h: i32, inv_freq: *const f3
     launch(st, move || {
         let (n, h) = (n as usize, h as usize);
         let w = h * 64;
-        for r in 0..n {
-            let t = t0 as usize + r;
-            let slot = (t % ring as usize) * w;
-            for i in 0..w / 2 {
-                let head = i / 32;
-                let p = i % 32;
-                let (sn, cs) = (t as f32 * *inv_freq.add(p)).sin_cos();
-                let c = bf16_to_f32(f32_to_bf16_rn(cs));
-                let s = bf16_to_f32(f32_to_bf16_rn(sn));
-                let base = r * 3 * w;
-                let e = head * 64 + 2 * p;
-                let q0 = *qkv.add(base + e);
-                let q1 = *qkv.add(base + e + 1);
-                let k0 = *qkv.add(base + w + e);
-                let k1 = *qkv.add(base + w + e + 1);
-                *q.add(r * w + e) = q0 * c - q1 * s;
-                *q.add(r * w + e + 1) = q1 * c + q0 * s;
-                *kc.add(slot + e) = k0 * c - k1 * s;
-                *kc.add(slot + e + 1) = k1 * c + k0 * s;
-                *vc.add(slot + e) = *qkv.add(base + 2 * w + e);
-                *vc.add(slot + e + 1) = *qkv.add(base + 2 * w + e + 1);
+        let (qkv, inv_freq, q, kc, vc) = (SendPtr(qkv as *mut f32), SendPtr(inv_freq as *mut f32), SendPtr(q), SendPtr(kc), SendPtr(vc));
+        par_for!(n, |lo, hi| {
+            for r in lo..hi {
+                let t = t0 as usize + r;
+                let slot = (t % ring as usize) * w;
+                for i in 0..w / 2 {
+                    let head = i / 32;
+                    let p = i % 32;
+                    let (sn, cs) = unsafe { (t as f32 * inv_freq.read(p)).sin_cos() };
+                    let c = bf16_to_f32(f32_to_bf16_rn(cs));
+                    let s = bf16_to_f32(f32_to_bf16_rn(sn));
+                    let base = r * 3 * w;
+                    let e = head * 64 + 2 * p;
+                    let q0 = unsafe { qkv.read(base + e) };
+                    let q1 = unsafe { qkv.read(base + e + 1) };
+                    let k0 = unsafe { qkv.read(base + w + e) };
+                    let k1 = unsafe { qkv.read(base + w + e + 1) };
+                    unsafe {
+                        q.write(r * w + e, q0 * c - q1 * s);
+                        q.write(r * w + e + 1, q1 * c + q0 * s);
+                        kc.write(slot + e, k0 * c - k1 * s);
+                        kc.write(slot + e + 1, k1 * c + k0 * s);
+                        vc.write(slot + e, qkv.read(base + 2 * w + e));
+                        vc.write(slot + e + 1, qkv.read(base + 2 * w + e + 1));
+                    }
+                }
             }
-        }
+        });
     })
 }
 
@@ -1707,34 +1882,37 @@ pub unsafe fn dr_codec_attn(q: *const f32, kc: *const f32, vc: *const f32, n: i3
     launch(st, move || {
         let (n, h) = (n as usize, h as usize);
         let w = h * 64;
-        for r in 0..n {
-            let t = t0 as usize + r;
-            let start = t.saturating_sub(window as usize - 1);
-            for hh in 0..h {
-                let mut m = f32::NEG_INFINITY;
-                let mut l = 0.0f32;
-                let mut acc = [0.0f32; 64];
-                for j in start..=t {
-                    let at = (j % ring as usize) * w + hh * 64;
-                    let mut s = 0.0f32;
-                    for dd in 0..64 {
-                        s += *q.add(r * w + hh * 64 + dd) * *kc.add(at + dd);
+        let (q, kc, vc, out) = (SendPtr(q as *mut f32), SendPtr(kc as *mut f32), SendPtr(vc as *mut f32), SendPtr(out));
+        par_for!(n, |lo, hi| {
+            for r in lo..hi {
+                let t = t0 as usize + r;
+                let start = t.saturating_sub(window as usize - 1);
+                for hh in 0..h {
+                    let mut m = f32::NEG_INFINITY;
+                    let mut l = 0.0f32;
+                    let mut acc = [0.0f32; 64];
+                    for j in start..=t {
+                        let at = (j % ring as usize) * w + hh * 64;
+                        let mut s = 0.0f32;
+                        for dd in 0..64 {
+                            s += unsafe { q.read(r * w + hh * 64 + dd) * kc.read(at + dd) };
+                        }
+                        s *= 0.125;
+                        let mn = m.max(s);
+                        let corr = (m - mn).exp();
+                        let p = (s - mn).exp();
+                        l = l * corr + p;
+                        for dd in 0..64 {
+                            acc[dd] = unsafe { acc[dd] * corr + p * vc.read(at + dd) };
+                        }
+                        m = mn;
                     }
-                    s *= 0.125;
-                    let mn = m.max(s);
-                    let corr = (m - mn).exp();
-                    let p = (s - mn).exp();
-                    l = l * corr + p;
                     for dd in 0..64 {
-                        acc[dd] = acc[dd] * corr + p * *vc.add(at + dd);
+                        unsafe { out.write(r * w + hh * 64 + dd, f32_to_f16_rn(acc[dd] / l)) };
                     }
-                    m = mn;
-                }
-                for dd in 0..64 {
-                    *out.add(r * w + hh * 64 + dd) = f32_to_f16_rn(acc[dd] / l);
                 }
             }
-        }
+        });
     })
 }
 
@@ -1742,13 +1920,16 @@ pub unsafe fn dr_codec_attn(q: *const f32, kc: *const f32, vc: *const f32, n: i3
 pub unsafe fn dr_swiglu16(h: *const f32, y: *mut Half, rows: i32, i: i32, st: Stream) -> i32 {
     launch(st, move || {
         let (rows, ii) = (rows as usize, i as usize);
-        for r in 0..rows {
-            for j in 0..ii {
-                let g = *h.add(r * 2 * ii + j);
-                let u = *h.add(r * 2 * ii + ii + j);
-                *y.add(r * ii + j) = f32_to_f16_rn(silu(g) * u);
+        let (h, y) = (SendPtr(h as *mut f32), SendPtr(y));
+        par_for!(rows, |lo, hi| {
+            for r in lo..hi {
+                for j in 0..ii {
+                    let g = unsafe { h.read(r * 2 * ii + j) };
+                    let u = unsafe { h.read(r * 2 * ii + ii + j) };
+                    unsafe { y.write(r * ii + j, f32_to_f16_rn(silu(g) * u)) };
+                }
             }
-        }
+        });
     })
 }
 
@@ -1756,15 +1937,18 @@ pub unsafe fn dr_swiglu16(h: *const f32, y: *mut Half, rows: i32, i: i32, st: St
 pub unsafe fn dr_conv_out(x: *const f32, n: i32, c: i32, k: i32, alpha: *const f32, w: *const f32, b: *const f32, out: *mut f32, st: Stream) -> i32 {
     launch(st, move || {
         let (n, c, k) = (n as usize, c as usize, k as usize);
-        for t in 0..n {
-            let mut acc = 0.0f32;
-            for j in 0..k {
-                for cc in 0..c {
-                    acc += *w.add(j * c + cc) * snake(*x.offset((t as isize - (k - 1 - j) as isize) * c as isize + cc as isize), *alpha.add(cc));
+        let (x, alpha, w, b, out) = (SendPtr(x as *mut f32), SendPtr(alpha as *mut f32), SendPtr(w as *mut f32), SendPtr(b as *mut f32), SendPtr(out));
+        par_for!(n, |lo, hi| {
+            for t in lo..hi {
+                let mut acc = 0.0f32;
+                for j in 0..k {
+                    for cc in 0..c {
+                        acc += unsafe { w.read(j * c + cc) * snake(*x.at((t as isize - (k - 1 - j) as isize) * c as isize + cc as isize), alpha.read(cc)) };
+                    }
                 }
+                unsafe { out.write(t, (acc + b.read(0)).tanh()) };
             }
-            *out.add(t) = (acc + *b.add(0)).tanh();
-        }
+        });
     })
 }
 
