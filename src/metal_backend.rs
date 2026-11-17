@@ -931,8 +931,14 @@ fn pending_enc(q: usize) -> bool {
 /// Call before any CPU read of GPU-produced data and at graph end.
 /// Panics with the Metal error on command-buffer failure: silent GPU errors
 /// used to poison downstream CPU reads (NaN -> topk panic far away).
-fn flush_gpu() {
+/// End, commit and wait for every pending command buffer (all queues).
+/// Call before any CPU read of GPU-produced data and at graph end.
+/// Returns 0 on success, 1 if any command buffer failed (silent GPU errors
+/// used to poison downstream CPU reads); failures are logged with the status.
+/// (metal 0.33 exposes no NSError details on CommandBuffer, only the status.)
+fn flush_gpu() -> i32 {
     use metal::MTLCommandBufferStatus;
+    let mut rc = 0;
     PENDING.with(|p| {
         let mut p = p.borrow_mut();
         for (_, cb, enc, _) in p.drain(..) {
@@ -940,10 +946,20 @@ fn flush_gpu() {
             cb.commit();
             cb.wait_until_completed();
             if cb.status() == MTLCommandBufferStatus::Error {
-                panic!("metal: command buffer failed (status=Error)");
+                eprintln!("metal: command buffer failed (status=Error)");
+                rc = 1;
             }
         }
     });
+    rc
+}
+
+/// flush_gpu for launch() closures: a failed buffer must abort the op, and
+/// launch converts the panic into return code 1 (established error path).
+fn flush_ok() {
+    if flush_gpu() != 0 {
+        panic!("metal: command buffer failed");
+    }
 }
 
 fn dispatch(name: &'static str, bufs: &[Option<(MBuf, u64)>], params: &[u8], grid: (u64, u64, u64), tg: (u64, u64, u64), threadgroups: bool) {
@@ -986,9 +1002,23 @@ fn ceil256(n: u64) -> u64 {
 // threads) must never clobber each other's convert/norm staging. A single
 // thread reuses its buffer monotonically (execution is synchronous, so there
 // is no aliasing hazard within a thread).
+/// TLS scratch slot: unregisters its buffer from BUFS on thread exit
+/// (otherwise the entry outlives the thread; shows up mostly in tests —
+/// pool workers persist, but test threads come and go). `static`s are never
+/// dropped, so BUFS is always alive here; ignore a poisoned lock.
+struct TrackedScratch(Option<MBuf>);
+impl Drop for TrackedScratch {
+    fn drop(&mut self) {
+        if let Some(b) = self.0.take() {
+            if let Ok(mut bufs) = BUFS.lock() {
+                bufs.remove(&(b.0.contents() as usize));
+            }
+        }
+    }
+}
 std::thread_local! {
-    static SCRATCH: std::cell::RefCell<Option<MBuf>> = const { std::cell::RefCell::new(None) };
-    static SCRATCH_W: std::cell::RefCell<Option<MBuf>> = const { std::cell::RefCell::new(None) };
+    static SCRATCH: std::cell::RefCell<TrackedScratch> = const { std::cell::RefCell::new(TrackedScratch(None)) };
+    static SCRATCH_W: std::cell::RefCell<TrackedScratch> = const { std::cell::RefCell::new(TrackedScratch(None)) };
 }
 
 fn scratch_f32(n_elems: usize) -> (MBuf, u64) {
@@ -999,22 +1029,22 @@ fn scratch_f32_w(n_elems: usize) -> (MBuf, u64) {
     scratch_here(&SCRATCH_W, n_elems)
 }
 
-fn scratch_here(slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<MBuf>>>, n_elems: usize) -> (MBuf, u64) {
+fn scratch_here(slot: &'static std::thread::LocalKey<std::cell::RefCell<TrackedScratch>>, n_elems: usize) -> (MBuf, u64) {
     slot.with(|s| {
         let mut s = s.borrow_mut();
         let need = (n_elems.max(1) as u64) * 4;
-        let ok = s.as_ref().map(|b| b.0.length() >= need).unwrap_or(false);
+        let ok = s.0.as_ref().map(|b| b.0.length() >= need).unwrap_or(false);
         if !ok {
             // Unregister the replaced buffer: pending command buffers hold their
             // own refs via set_buffer, so removal is safe and stops BUFS growth.
-            if let Some(old) = s.take() {
+            if let Some(old) = s.0.take() {
                 BUFS.lock().unwrap().remove(&(old.0.contents() as usize));
             }
             let b = ctx().device.0.new_buffer(need, metal::MTLResourceOptions::StorageModeShared);
             track(&b);
-            *s = Some(MBuf(b));
+            s.0 = Some(MBuf(b));
         }
-        (s.as_ref().unwrap().clone(), 0)
+        (s.0.as_ref().unwrap().clone(), 0)
     })
 }
 
@@ -1232,21 +1262,21 @@ pub unsafe fn dr_h2d(d: *mut c_void, h: *const c_void, n: usize, st: Stream) -> 
 pub unsafe fn dr_d2h(h: *mut c_void, d: *const c_void, n: usize, st: Stream) -> i32 {
     // CPU reads GPU-produced data: drain the pending batch first.
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         raw_copy(h, d, n)
     })
 }
 
 pub unsafe fn dr_d2d(d: *mut c_void, s: *const c_void, n: usize, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         raw_copy(d, s, n)
     })
 }
 
 pub unsafe fn dr_memset(d: *mut c_void, v: i32, n: usize, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         if n > 0 {
             std::slice::from_raw_parts_mut(d as *mut u8, n).fill(v as u8);
         }
@@ -1262,8 +1292,8 @@ pub unsafe fn dr_stream_create(s: *mut Stream) -> i32 {
 
 pub unsafe fn dr_stream_sync(_s: Stream) -> i32 {
     // H1: with batched dispatches, sync must drain the pending queue.
-    flush_gpu();
-    0
+    // Runs outside launch(), so the code is returned, not panicked.
+    flush_gpu()
 }
 
 pub unsafe fn dr_mem_info(free_b: *mut usize, total_b: *mut usize) -> i32 {
@@ -1451,7 +1481,7 @@ pub unsafe fn dr_sample_init() -> i32 {
 /// renormalised weights; shared-expert gate logit at column E.
 pub unsafe fn dr_moe_topk(logits: *const f32, rows: i32, e: i32, topk: i32, stride: i32, idx: *mut i32, wts: *mut f32, sgate: *mut f32, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (rows, e, topk, stride) = (rows as usize, e as usize, topk as usize, stride as usize);
         for r in 0..rows {
             let l = &f32s(logits, (r + 1) * stride)[r * stride..];
@@ -1474,7 +1504,7 @@ pub unsafe fn dr_moe_topk(logits: *const f32, rows: i32, e: i32, topk: i32, stri
 /// CPU: counts[e] += #{i : idx[i] == e}.
 pub unsafe fn dr_moe_count(idx: *const i32, n: i32, counts: *mut i32, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         for i in 0..n as usize {
             let e = *idx.add(i) as usize;
             *counts.add(e) += 1;
@@ -1485,7 +1515,7 @@ pub unsafe fn dr_moe_count(idx: *const i32, n: i32, counts: *mut i32, st: Stream
 /// CPU: scatter bf16 rows of x into expert-sorted order.
 pub unsafe fn dr_moe_permute(idx: *const i32, rows: i32, topk: i32, offsets: *const i32, fill: *mut i32, slot_of: *mut i32, x: *const Half, xp: *mut Half, h: i32, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (rows, topk, h) = (rows as usize, topk as usize, h as usize);
         for i in 0..rows * topk {
             let e = *idx.add(i) as usize;
@@ -1501,7 +1531,7 @@ pub unsafe fn dr_moe_permute(idx: *const i32, rows: i32, topk: i32, offsets: *co
 /// CPU: x[r] += sigmoid(sgate[r]) * shared[r] + sum_k w[r,k] * Y[slot_of[r,k]].
 pub unsafe fn dr_moe_combine(x: *mut f32, y: *const f32, slot_of: *const i32, wts: *const f32, sgate: *const f32, shared: *const f32, rows: i32, topk: i32, h: i32, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (rows, topk, h) = (rows as usize, topk as usize, h as usize);
         for r in 0..rows {
             let sg = sigmoid(*sgate.add(r));
@@ -1581,7 +1611,7 @@ fn sample_logits(logits: &[f32], temp: f32, top_k: i32, top_p: f32, u: f32) -> u
 
 pub unsafe fn dr_sample_main(logits: *const f32, n: i32, prm: *const c_void, ras: *const i32, ras_len: i32, step: *const u64, eos: i32, sem0: i32, cb: i32, frame: *mut i32, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let p = *(prm as *const SampleParams);
         let l = f32s(logits, n as usize);
         let s = *step;
@@ -1603,7 +1633,7 @@ pub unsafe fn dr_sample_main(logits: *const f32, n: i32, prm: *const c_void, ras
 
 pub unsafe fn dr_sample_head(logits: *const f32, n: i32, prm: *const c_void, stream: i32, step: *const u64, frame: *mut i32, col: i32, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let p = *(prm as *const SampleParams);
         let l = f32s(logits, n as usize);
         let u = philox_uniform(p.seed, stream as u64, *step);
@@ -1614,7 +1644,7 @@ pub unsafe fn dr_sample_head(logits: *const f32, n: i32, prm: *const c_void, str
 
 pub unsafe fn dr_frame_end(next: *const i32, in_frame: *mut i32, ras: *mut i32, ras_len: i32, pos: *mut i32, step: *mut u64, hist: *mut i32, hist_len: *mut i32, hist_cap: i32, width: i32, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (ras_len, width) = (ras_len as usize, width as usize);
         for i in 0..width {
             *in_frame.add(i) = *next.add(i);
@@ -1708,7 +1738,7 @@ pub unsafe fn dr_gemv_q8(w: *const i8, s: *const Half, x: *const f32, res: *cons
 /// CPU: y[j] = silu(W[j] . norm(x)) * (W[I + j] . norm(x)).
 pub unsafe fn dr_gemv_q8_swiglu(w: *const i8, s: *const Half, x: *const f32, y: *mut f32, i: i32, k: i32, nw: *const f32, eps: f32, _pf: *const c_char, _pfb: usize, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (i, k) = (i as usize, k as usize);
         let xn = norm_fused(f32s(x, k), if nw.is_null() { None } else { Some(f32s(nw, k)) }, eps);
         let (w, s, y) = (SendPtr(w as *mut i8), SendPtr(s as *mut Half), SendPtr(y));
@@ -1726,7 +1756,7 @@ pub unsafe fn dr_gemv_q8_swiglu(w: *const i8, s: *const Half, x: *const f32, y: 
 /// CPU: router logits (fused norm) + softmax/top-k; warms nothing, resets counter.
 pub unsafe fn dr_router_topk(w: *const Half, x: *const f32, nw: *const f32, eps: f32, logits: *mut f32, e: i32, topk: i32, k: i32, idx: *mut i32, wts: *mut f32, sgate: *mut f32, counter: *mut u32, _gq: *const c_char, _gs: *const c_char, _dq: *const c_char, _ds: *const c_char, _gqb: usize, _gsb: usize, _dqb: usize, _dsb: usize, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (e, topk, k) = (e as usize, topk as usize, k as usize);
         let wv = std::slice::from_raw_parts(w, (e + 1) * k);
         let xn = norm_fused(f32s(x, k), if nw.is_null() { None } else { Some(f32s(nw, k)) }, eps);
@@ -1894,7 +1924,7 @@ pub unsafe fn dr_moe_prefill(gu_q: *const u8, gu_sm: *const Half, d_q: *const u8
 /// CPU: backbone input rows (prefill gather or decode candidate lookup + codes).
 pub unsafe fn dr_embed(rows_emb: *const Half, cand_table: *const Half, frames: *const i32, fstride: i32, cb_emb: *const Half, x: *mut f32, rows: i32, d: i32, sem0: i32, sem1: i32, eos: i32, cb: i32, nb: i32, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (rows, d, fstride) = (rows as usize, d as usize, fstride as usize);
         for r in 0..rows {
             // Decode passes fstride = 0 for its single row; size the row view by use.
@@ -1935,7 +1965,7 @@ pub unsafe fn dr_embed(rows_emb: *const Half, cand_table: *const Half, frames: *
 /// CPU: tower layer input — [rms(e) | rms(h)] with label/codebook gathers.
 pub unsafe fn dr_tower_in(h: *const f32, frames: *const i32, fstride: i32, code_col: i32, in_frames: *const i32, in_stride: i32, tok_emb: *const Half, cb_emb: *const Half, enorm: *const f32, hnorm: *const f32, pre_norm: *const f32, y: *mut f32, yb: *mut Half, rows: i32, d: i32, sem0: i32, sem1: i32, cb: i32, ncb: i32, nb: i32, eps: f32, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (rows, d) = (rows as usize, d as usize);
         let (fstride, code_col) = (fstride as usize, code_col as usize);
         for r in 0..rows {
@@ -1999,7 +2029,7 @@ pub unsafe fn dr_tower_in(h: *const f32, frames: *const i32, fstride: i32, code_
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn dr_qk_norm_rope(qkv: *const f32, rs: i32, rows: i32, h: i32, hkv: i32, hd: i32, qn: *const f32, kn: *const f32, inv_freq: *const f32, rot: i32, interleaved: i32, pos_base: *const i32, pos_off: i32, q_out: *mut f32, kc: *mut Half, vc: *mut Half, eps: f32, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (rs, rows, h, hkv, hd, rot) = (rs as usize, rows as usize, h as usize, hkv as usize, hd as usize, rot as usize);
         for r in 0..rows {
             let pos = (*pos_base.add(0) + pos_off) as usize + r;
@@ -2096,7 +2126,7 @@ pub unsafe fn dr_attn_prefill(q: *const f32, kc: *const Half, vc: *const Half, g
         return 1;
     }
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (rows, h, hkv, hd) = (rows as usize, h as usize, hkv as usize, hd as usize);
         let pos0 = (*pos_base.add(0) + pos_off) as usize;
         // KV caches are append-only and sized max_len rows; the prompt fits by construction.
@@ -2117,7 +2147,7 @@ pub unsafe fn dr_attn_decode(q: *const f32, kc: *const Half, vc: *const Half, ga
     // Bisect hatch: DRAMA_CPU_ATTN=1 restores the pre-H4 CPU path.
     if std::env::var("DRAMA_CPU_ATTN").is_ok() {
         return launch(st, move || {
-            flush_gpu();
+            flush_ok();
             let (h, hkv, hd) = (h as usize, hkv as usize, hd as usize);
             let pos0 = (*pos_base.add(0) + pos_off) as usize;
             let max_keys = pos0 + 1;
@@ -2156,7 +2186,7 @@ pub unsafe fn dr_attn_decode(q: *const f32, kc: *const Half, vc: *const Half, ga
 /// CPU: causal depthwise conv (kernel 4) + SiLU; state keeps 3 inputs/channel.
 pub unsafe fn dr_conv(input: *const f32, in_stride: i32, w: *const f32, state: *mut f32, out: *mut f32, n: i32, c: i32, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (n, c, ins) = (n as usize, c as usize, in_stride as usize);
         let (input, w, state, out) = (SendPtr(input as *mut f32), SendPtr(w as *mut f32), SendPtr(state), SendPtr(out));
         par_for!(c, |lo, hi| {
@@ -2191,7 +2221,7 @@ unsafe fn dr_gdn_cpu(conv: *const f32, proj: *const f32, ps: i32, z_off: i32, b_
         return 1;
     }
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         const DK: usize = 128;
         let (n, nk, nv) = (n as usize, nk as usize, nv as usize);
         let (ps, z_off, b_off, a_off) = (ps as usize, z_off as usize, b_off as usize, a_off as usize);
@@ -2293,7 +2323,7 @@ pub unsafe fn dr_gdn(conv: *const f32, proj: *const f32, ps: i32, z_off: i32, b_
             true,
         );
         if std::env::var("DRAMA_DEBUG_GDN").is_ok() {
-            flush_gpu();
+            flush_ok();
             let oo = unsafe { std::slice::from_raw_parts(o as *const f32, (n as usize) * (nv as usize) * 128) };
             let bad = oo.iter().filter(|x| !x.is_finite()).count();
             let mx = oo.iter().cloned().fold(0f32, |a, x| if x.is_finite() { a.max(x.abs()) } else { a });
@@ -2342,7 +2372,7 @@ pub fn f32_to_f16_rn(v: f32) -> u16 {
 /// CPU: out[t] = sum_c table[row(c, codes[t, c])].
 pub unsafe fn dr_rvq_sum(codes: *const i32, frames: i32, ncb: i32, table: *const f32, out: *mut f32, d: i32, sem_size: i32, res_size: i32, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (frames, ncb, d) = (frames as usize, ncb as usize, d as usize);
         let (sem, res) = (sem_size as usize, res_size as usize);
         let out = SendPtr(out);
@@ -2369,7 +2399,7 @@ pub unsafe fn dr_rvq_sum(codes: *const i32, frames: i32, ncb: i32, table: *const
 /// CPU: causal im2col with optional snake -> f16.
 pub unsafe fn dr_im2col(x: *const f32, n: i32, c: i32, k: i32, d: i32, s: i32, alpha: *const f32, out: *mut Half, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (n, c, k, dil, strd) = (n as usize, c as usize, k as usize, d as isize, s as isize);
         let has_a = !alpha.is_null();
         let (x, alpha, out) = (SendPtr(x as *mut f32), SendPtr(alpha as *mut f32), SendPtr(out));
@@ -2393,7 +2423,7 @@ pub unsafe fn dr_im2col(x: *const f32, n: i32, c: i32, k: i32, d: i32, s: i32, a
 /// CPU: one residual-VQ stage per row (argmax cosine, lower-index tie-break).
 pub unsafe fn dr_vq_encode(r: *mut f32, rows: i32, d: i32, in_w: *const f32, in_b: *const f32, codebook_n: *const f32, n: i32, table: *const f32, codes: *mut i32, code_stride: i32, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (rows, d) = (rows as usize, d as usize);
         let (r, in_w, in_b, codebook_n, table, codes) = (SendPtr(r), SendPtr(in_w as *mut f32), SendPtr(in_b as *mut f32), SendPtr(codebook_n as *mut f32), SendPtr(table as *mut f32), SendPtr(codes));
         par_for!(rows, |lo, hi| {
@@ -2427,7 +2457,7 @@ pub unsafe fn dr_vq_encode(r: *mut f32, rows: i32, d: i32, in_w: *const f32, in_
 /// CPU: transposed-conv input gather ([snake(x[t]) | snake(x[t-1])]) -> f16.
 pub unsafe fn dr_tconv_gather(x: *const f32, n: i32, c: i32, two: i32, alpha: *const f32, out: *mut Half, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (n, c) = (n as usize, c as usize);
         let w = if two != 0 { 2 * c } else { c };
         let has_a = !alpha.is_null();
@@ -2451,7 +2481,7 @@ pub unsafe fn dr_tconv_gather(x: *const f32, n: i32, c: i32, two: i32, alpha: *c
 /// CPU: biased/scaled activation (+residual) -> f32 and/or f16.
 pub unsafe fn dr_epilogue(y: *const f32, n: usize, c: i32, bias: *const f32, scale: *const f32, res: *const f32, act: i32, out: *mut f32, out16: *mut Half, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let c = c as usize;
         let (y, bias, scale, res, out, out16) =
             (SendPtr(y as *mut f32), SendPtr(bias as *mut f32), SendPtr(scale as *mut f32), SendPtr(res as *mut f32), SendPtr(out), SendPtr(out16));
@@ -2484,7 +2514,7 @@ pub unsafe fn dr_epilogue(y: *const f32, n: usize, c: i32, bias: *const f32, sca
 /// CPU: depthwise causal conv + bias.
 pub unsafe fn dr_dwconv(x: *const f32, t: i32, c: i32, k: i32, w: *const f32, b: *const f32, out: *mut f32, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (t, c, k) = (t as usize, c as usize, k as usize);
         let (x, w, b, out) = (SendPtr(x as *mut f32), SendPtr(w as *mut f32), SendPtr(b as *mut f32), SendPtr(out));
         par_for!(t, |lo, hi| {
@@ -2504,7 +2534,7 @@ pub unsafe fn dr_dwconv(x: *const f32, t: i32, c: i32, k: i32, w: *const f32, b:
 /// CPU: affine LayerNorm per row -> f16.
 pub unsafe fn dr_layernorm(x: *const f32, rows: i32, c: i32, w: *const f32, b: *const f32, eps: f32, out: *mut Half, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (rows, c) = (rows as usize, c as usize);
         let (x, w, b, out) = (SendPtr(x as *mut f32), SendPtr(w as *mut f32), SendPtr(b as *mut f32), SendPtr(out));
         par_for!(rows, |lo, hi| {
@@ -2524,7 +2554,7 @@ pub unsafe fn dr_layernorm(x: *const f32, rows: i32, c: i32, w: *const f32, b: *
 /// CPU: plain-weight RMSNorm per row -> f32 and/or f16.
 pub unsafe fn dr_rmsnorm_plain(x: *const f32, rows: i32, c: i32, w: *const f32, eps: f32, out: *mut f32, out16: *mut Half, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (rows, c) = (rows as usize, c as usize);
         let (x, w, out, out16) = (SendPtr(x as *mut f32), SendPtr(w as *mut f32), SendPtr(out), SendPtr(out16));
         par_for!(rows, |lo, hi| {
@@ -2550,7 +2580,7 @@ pub unsafe fn dr_rmsnorm_plain(x: *const f32, rows: i32, c: i32, w: *const f32, 
 /// reference table) + ring KV-cache write.
 pub unsafe fn dr_codec_rope(qkv: *const f32, n: i32, h: i32, inv_freq: *const f32, t0: i32, ring: i32, q: *mut f32, kc: *mut f32, vc: *mut f32, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (n, h) = (n as usize, h as usize);
         let w = h * 64;
         let (qkv, inv_freq, q, kc, vc) = (SendPtr(qkv as *mut f32), SendPtr(inv_freq as *mut f32), SendPtr(q), SendPtr(kc), SendPtr(vc));
@@ -2587,7 +2617,7 @@ pub unsafe fn dr_codec_rope(qkv: *const f32, n: i32, h: i32, inv_freq: *const f3
 /// CPU: causal windowed attention over the ring caches, head_dim 64 -> f16.
 pub unsafe fn dr_codec_attn(q: *const f32, kc: *const f32, vc: *const f32, n: i32, h: i32, window: i32, t0: i32, ring: i32, out: *mut Half, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (n, h) = (n as usize, h as usize);
         let w = h * 64;
         let (q, kc, vc, out) = (SendPtr(q as *mut f32), SendPtr(kc as *mut f32), SendPtr(vc as *mut f32), SendPtr(out));
@@ -2627,7 +2657,7 @@ pub unsafe fn dr_codec_attn(q: *const f32, kc: *const f32, vc: *const f32, n: i3
 /// CPU: y[t, j] = silu(h[t, j]) * h[t, I + j] -> f16.
 pub unsafe fn dr_swiglu16(h: *const f32, y: *mut Half, rows: i32, i: i32, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (rows, ii) = (rows as usize, i as usize);
         let (h, y) = (SendPtr(h as *mut f32), SendPtr(y));
         par_for!(rows, |lo, hi| {
@@ -2645,7 +2675,7 @@ pub unsafe fn dr_swiglu16(h: *const f32, y: *mut Half, rows: i32, i: i32, st: St
 /// CPU: final layer — tanh over the snake-activated causal conv.
 pub unsafe fn dr_conv_out(x: *const f32, n: i32, c: i32, k: i32, alpha: *const f32, w: *const f32, b: *const f32, out: *mut f32, st: Stream) -> i32 {
     launch(st, move || {
-        flush_gpu();
+        flush_ok();
         let (n, c, k) = (n as usize, c as usize, k as usize);
         let (x, alpha, w, b, out) = (SendPtr(x as *mut f32), SendPtr(alpha as *mut f32), SendPtr(w as *mut f32), SendPtr(b as *mut f32), SendPtr(out));
         par_for!(n, |lo, hi| {
